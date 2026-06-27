@@ -273,8 +273,9 @@ def get_cap_backend():
 def get_cam_names():
     """枚举系统中存在的摄像头及其名称。"""
     names = []
+    backend = get_cap_backend()
     for i in range(10):
-        cap = cv2.VideoCapture(i)
+        cap = cv2.VideoCapture(i, backend)
         if cap.isOpened():
             # 尝试读取一帧以确认摄像头可用
             ret, _ = cap.read()
@@ -283,26 +284,26 @@ def get_cam_names():
                 name = cap.getBackendName()
                 names.append(f"摄像头{i} ({name})")
             cap.release()
-        else:
-            cap.release()
     return names if names else [f"摄像头{i}" for i in range(3)]
 
 def open_cam(idx):
     backend = get_cap_backend()
     cap = cv2.VideoCapture(idx, backend)
-    # 获取摄像头支持的最大分辨率
+    # 不主动设置分辨率，使用摄像头默认的最高分辨率
     cap_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cap_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap_fps = int(cap.get(cv2.CAP_PROP_FPS))
-    # 尝试设置为最大分辨率
-    for w, h in [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)]:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if actual_w == w and actual_h == h:
-            cap_w, cap_h = w, h
-            break
+    # 如果默认分辨率太低，尝试逐步提升
+    if cap_w < 1280 or cap_h < 720:
+        for w, h in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)]:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if actual_w == w and actual_h == h:
+                cap_w, cap_h = w, h
+                break
+    # 设置帧率
     cap.set(cv2.CAP_PROP_FPS, 30)
     if cap.isOpened():
         cap_fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
@@ -792,17 +793,17 @@ while running:
     # ====== Date/time display (top-right, won't block buttons) ======
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d %H:%M:%S").replace("-0", "-")
-    # 分辨率和帧率信息
-    res_str = f"{cam_w}x{cam_h} @ {cam_fps}fps"
-    info_str = f"{date_str} | {res_str}"
     # Measure text size to right-align
     tmp_pil = Image.new("RGB", (1, 1))
     tmp_d = ImageDraw.Draw(tmp_pil)
     tmp_font = ImageFont.truetype(font_path, 14) if font_path else ImageFont.load_default()
-    bbox = tmp_d.textbbox((0, 0), info_str, font=tmp_font)
+    bbox = tmp_d.textbbox((0, 0), date_str, font=tmp_font)
     text_w = bbox[2] - bbox[0] + 8
-    info_x = w - text_w - 10
-    ann = draw_cn(ann, info_str, (info_x, 8), 14, (255, 255, 200))
+    date_x = w - text_w - 10
+    ann = draw_cn(ann, date_str, (date_x, 8), 14, (255, 255, 200))
+    # 分辨率和帧率信息（在日期下方）
+    res_str = f"{cam_w}x{cam_h} @ {cam_fps}fps"
+    ann = draw_cn(ann, res_str, (date_x, 26), 14, (255, 255, 200))
 
     # ====== Auto-snapshot ======
     if auto_snap and focus and focus_id >= 0 and not paused and not sel:
