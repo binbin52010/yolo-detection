@@ -715,6 +715,9 @@ while running:
             cv2.rectangle(ann, (x1, y1), (x2, y2), color, 2)
             ann = draw_cn(ann, f"{cn_label} {conf:.2f}",
                           (x1 + 2, y1 - 22), 16, color, (0, 0, 0))
+    else:
+        # Paused: still need a valid ann frame for display
+        pass
 
     h, w = ann.shape[:2]
 
