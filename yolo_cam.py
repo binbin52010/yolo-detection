@@ -693,7 +693,7 @@ while running:
         ret, frame = cap.read()
         if not ret:
             cap.release()
-            cap = open_cam(cur)
+            cap, cam_w, cam_h, cam_fps = open_cam(cur)
             ret, frame = cap.read()
         if not ret:
             break
