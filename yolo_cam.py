@@ -390,13 +390,13 @@ class ButtonManager:
 
 
 # ====== State ======
-cam_names = get_cam_names()
 cur = 0
 cap, cam_w, cam_h, cam_fps = open_cam(cur)
 if not cap.isOpened():
     print("Cannot open camera")
     input()
     exit(1)
+cam_names = get_cam_names()  # 必须在 open_cam 之后调用
 
 win = "YOLOv8"
 full = False
@@ -888,13 +888,9 @@ while running:
         toggle_full()
     elif key == ord("c"):
         do_switch_cam(1)
-        # 更新摄像头列表
-        global cam_names
         cam_names = get_cam_names()
     elif key == ord("x"):
         do_switch_cam(-1)
-        # 更新摄像头列表
-        global cam_names
         cam_names = get_cam_names()
     elif key == ord("p"):
         do_toggle_pause()
