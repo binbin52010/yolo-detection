@@ -263,7 +263,7 @@ def get_cap_backend():
 def open_cam(idx):
     backend = get_cap_backend()
     cap = cv2.VideoCapture(idx, backend)
-    for w, h in [(1920, 1080), (1600, 900), (1280, 720)]:
+    for w, h in [(2560, 1440), (1920, 1080), (1600, 900), (1280, 720)]:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         cap.set(cv2.CAP_PROP_FPS, 30)
@@ -373,8 +373,8 @@ sel = False
 sel_page = 0
 paused = False
 show_help = False
-auto_snap = False
-snap_cooldown = 3.0
+auto_snap = True  # 默认开启自动拍照（检测到人物且置信度高时拍一张）
+snap_cooldown = 10.0  # 人物检测拍照冷却时间（秒），避免连续拍照
 last_snap_time = 0.0
 snap_flash = 0
 snap_mode = "crop"   # "crop" = 拍检测物体, "full" = 全屏拍照(带水印)
@@ -783,9 +783,11 @@ while running:
                     best_label = get_cn(all_names[cid])
 
         if target_present and best_crop is not None and (now_time - last_snap_time) > snap_cooldown:
-            if save_snapshot(best_crop, best_label, best_conf, full_frame=(snap_mode == "full")):
-                last_snap_time = now_time
-                snap_flash = 12  # Flash frames
+            # 只有置信度 >= 0.6 时才拍照，确保拍到清晰可识别的人物
+            if best_conf >= 0.6:
+                if save_snapshot(best_crop, best_label, best_conf, full_frame=(snap_mode == "full")):
+                    last_snap_time = now_time
+                    snap_flash = 12  # Flash frames
 
     # Flash effect
     if snap_flash > 0:
