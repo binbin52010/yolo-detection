@@ -4,3 +4,4 @@ ultralytics==8.4.75
 opencv-python==4.9.0.80
 pillow
 numpy<2
+sounddevice>=0.5.0
