@@ -15,7 +15,8 @@ from phone_stream import MJPEGStreamer, make_qr_image
 
 import sys as _sys, os as _os
 # 后台隐藏运行时（pythonw 无控制台）把输出写入日志文件，便于排查问题
-if not (_sys.stdout and getattr(_sys.stdout, "isatty", lambda: False)()):
+if (not (_sys.stdout and getattr(_sys.stdout, "isatty", lambda: False)()) and
+        _os.environ.get("YOLO_FORCE_STDOUT", "0").lower() not in {"1", "true", "yes", "on"}):
     try:
         _log_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "yolo_cam.log")
         _logf = open(_log_path, "a", encoding="utf-8", buffering=1)
@@ -226,6 +227,9 @@ MIN_PERSON_BOX_HEIGHT = 160
 SNAP_DIR = BASE_DIR / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
 MAX_STORAGE_GB = 10  # Max storage size in GB (adjustable)
+snapshot_lock = threading.RLock()
+snapshot_count = sum(1 for _p in SNAP_DIR.iterdir()
+                     if _p.is_file() and _p.suffix.lower() in (".jpg", ".jpeg", ".png"))
 
 # ====== 录制（录屏回放） ======
 REC_DIR = BASE_DIR / "recordings"
@@ -298,8 +302,14 @@ def phone_command(action):
         do_toggle_detection()
         return "detection on" if detection_enabled else "monitor on"
     elif action == "multi_toggle":
-        pending_main_actions.append("multi_toggle")
-        return "multi queued"
+        with pending_actions_lock:
+            if "multi_toggle" not in pending_main_actions and not camera_switching:
+                pending_main_actions.append("multi_toggle")
+                return "multi queued"
+        return "multi busy"
+    elif action == "auto_snap_toggle":
+        do_toggle_auto_snap()
+        return "auto snap on" if auto_snap else "auto snap off"
     elif action in ("record", "rec_toggle"):
         toggle_recording()
         return "recording on" if recording else "recording off"
@@ -360,15 +370,15 @@ def add_watermark(img):
     d.text((tx, ty), ts, font=font, fill=(255, 255, 200))
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
-def save_snapshot(frame, label, conf, full_frame=False):
+def _save_snapshot_unlocked(frame, label, conf, full_frame=False):
     """Save a snapshot with timestamp filename, manage storage.
     full_frame=True: save entire frame with watermark.
     full_frame=False: save cropped detection."""
-    global last_snap_path
+    global last_snap_path, snapshot_count
     cleanup_old_snapshots()
 
     now = datetime.datetime.now()
-    ts = now.strftime("%Y-%m-%d-%H-%M-%S")
+    ts = now.strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
     safe_label = label.replace("/", "_").replace("\\", "_")
 
     # 动态调整照片分辨率，避免图片太大占用空间
@@ -405,16 +415,23 @@ def save_snapshot(frame, label, conf, full_frame=False):
         size_mb = get_dir_size_mb()
         print(f"  [拍照] {fname}  ({size_mb:.1f} MB / {MAX_STORAGE_GB} GB)")
         last_snap_path = str(fpath)
+        snapshot_count += 1
         return True
     except Exception as e:
         print(f"  [拍照失败] {e}")
         return False
 
+
+def save_snapshot(frame, label, conf, full_frame=False):
+    """Thread-safe snapshot entry used by desktop, phone and auto capture."""
+    with snapshot_lock:
+        return _save_snapshot_unlocked(frame, label, conf, full_frame=full_frame)
+
 def get_boxes_data(boxes):
     if boxes is None:
         return [], [], [], []
     if isinstance(boxes, dict):
-        return boxes['xyxy'], boxes['conf'], boxes['cls'], boxes.get('track_id', [])
+        return boxes.get('xyxy', boxes.get('boxes', [])), boxes.get('conf', []), boxes.get('cls', []), boxes.get('track_id', [])
     track_ids = []
     if getattr(boxes, 'id', None) is not None:
         track_ids = boxes.id.int().cpu().tolist()
@@ -425,6 +442,113 @@ def is_valid_person_box(x1, y1, x2, y2):
     box_w = max(0, x2 - x1)
     box_h = max(0, y2 - y1)
     return box_h >= MIN_PERSON_BOX_HEIGHT and (box_w * box_h) >= MIN_PERSON_BOX_AREA
+
+
+def reset_auto_snap_state(camera_key=None):
+    """Reset suppression state so a new camera/person can be captured at once."""
+    global last_snap_target, last_snap_time
+    if camera_key is None:
+        auto_snap_states.clear()
+    else:
+        auto_snap_states.pop(camera_key, None)
+    last_snap_target = None
+    last_snap_time = 0.0
+
+
+def maybe_auto_snapshot(source_frame, boxes, camera_key, source_label=None):
+    """Capture the best person, with movement and periodic fallback triggers."""
+    global last_snap_target, last_snap_time, snap_flash
+    if (not detection_enabled or not auto_snap or paused or sel or not focus or
+            focus_id < 0 or source_frame is None):
+        return False
+
+    now_time = time.time()
+    state = auto_snap_states.setdefault(camera_key, {
+        'last_time': 0.0,
+        'last_target': None,
+        'missing_since': None,
+        'absence_reset': False,
+    })
+    frame_h, frame_w = source_frame.shape[:2]
+    xyxy_list, conf_list, cls_list, track_id_list = get_boxes_data(boxes)
+
+    best = None
+    best_score = -1.0
+    for i in range(len(xyxy_list)):
+        cid = int(cls_list[i])
+        if cid != focus_id:
+            continue
+        x1, y1, x2, y2 = map(int, xyxy_list[i])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame_w, x2), min(frame_h, y2)
+        if not is_valid_person_box(x1, y1, x2, y2):
+            continue
+        conf = float(conf_list[i])
+        if conf < PERSON_CONF:
+            continue
+        track_id = int(track_id_list[i]) if i < len(track_id_list) else -1
+        area_score = ((x2 - x1) * (y2 - y1)) / max(frame_w * frame_h, 1)
+        score = conf + (0.15 if track_id >= 0 else 0.0) + area_score
+        if score > best_score:
+            best_score = score
+            best = (cid, conf, x1, y1, x2, y2)
+
+    if best is None:
+        if state['missing_since'] is None:
+            state['missing_since'] = now_time
+        elif (not state['absence_reset'] and
+              now_time - state['missing_since'] >= snap_absence_reset):
+            # A person leaving and returning is a new event, even if the previous
+            # photo was less than the normal stationary-person interval ago.
+            state['last_target'] = None
+            state['absence_reset'] = True
+        return False
+
+    state['missing_since'] = None
+    state['absence_reset'] = False
+    cid, conf, x1, y1, x2, y2 = best
+    curr_target = ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
+    elapsed = now_time - state['last_time']
+    should_snap = (state['last_target'] is None and
+                   (state['last_time'] <= 0.0 or elapsed >= snap_cooldown))
+
+    if not should_snap and elapsed >= snap_max_interval:
+        # Stationary people still need periodic evidence; the previous logic
+        # could suppress all photos forever after the first one.
+        should_snap = True
+    elif not should_snap and elapsed >= snap_cooldown:
+        prev_cx, prev_cy, prev_w, prev_h = state['last_target']
+        curr_cx, curr_cy, curr_w, curr_h = curr_target
+        move_dist = (((curr_cx - prev_cx) / max(frame_w, 1)) ** 2 +
+                     ((curr_cy - prev_cy) / max(frame_h, 1)) ** 2) ** 0.5
+        prev_area = prev_w * prev_h
+        curr_area = curr_w * curr_h
+        size_change = abs(curr_area - prev_area) / max(prev_area, 1)
+        should_snap = (move_dist > snap_move_threshold or
+                       size_change > snap_size_threshold)
+
+    if not should_snap:
+        return False
+
+    margin = int((x2 - x1) * 0.15)
+    crop = source_frame[max(0, y1 - margin):min(frame_h, y2 + margin),
+                        max(0, x1 - margin):min(frame_w, x2 + margin)].copy()
+    if crop.size == 0:
+        return False
+    label = get_cn(all_names[cid])
+    if source_label:
+        label = f"{source_label}_{label}"
+    snap_frame = source_frame if snap_mode == "full" else crop
+    if not save_snapshot(snap_frame, label, conf, full_frame=(snap_mode == "full")):
+        return False
+
+    state['last_time'] = now_time
+    state['last_target'] = curr_target
+    last_snap_time = now_time
+    last_snap_target = curr_target
+    snap_flash = 12
+    print(f"  [自动拍] {source_label or '当前摄像头'} 已保存")
+    return True
 
 
 def pick_best_detection(frame, boxes, valid_cids):
@@ -501,36 +625,71 @@ def get_cap_backend():
     return get_cap_backends()[0]
 
 
-def try_open_camera(idx):
+def _read_valid_camera_frame(cap, min_valid=3, max_attempts=10, delay=0.025):
+    """Require several real frames before accepting a camera index.
+
+    Some Windows backends briefly report ``isOpened()`` for unavailable/phantom
+    indexes. A single successful read is not enough and caused bogus cameras to
+    enter multi-camera mode. Requiring consecutive non-empty frames keeps the
+    device list stable without rejecting a legitimately dark scene.
+    """
+    valid = 0
+    last_frame = None
+    expected_shape = None
+    for _ in range(max_attempts):
+        try:
+            ret, frame = cap.read()
+        except Exception:
+            ret, frame = False, None
+        if ret and frame is not None and frame.size > 0 and frame.ndim == 3:
+            shape = frame.shape[:2]
+            if expected_shape is None or shape == expected_shape:
+                valid += 1
+                expected_shape = shape
+                last_frame = frame
+                if valid >= min_valid:
+                    return last_frame
+            else:
+                valid = 1
+                expected_shape = shape
+                last_frame = frame
+        else:
+            valid = 0
+        if delay:
+            time.sleep(delay)
+    return None
+
+
+def try_open_camera(idx, verify=False):
     for backend in get_cap_backends():
         cap = cv2.VideoCapture(idx, backend)
         if cap.isOpened():
-            return cap, backend
+            if not verify or _read_valid_camera_frame(cap) is not None:
+                return cap, backend
         cap.release()
     return cv2.VideoCapture(), None
 
+
 def get_camera_devices(active_index=None):
-    """Enumerate usable cameras without reopening the camera already in use."""
+    """Enumerate cameras that can continuously deliver valid frames."""
     devices = []
     if active_index is not None:
         devices.append({
             'index': int(active_index),
             'label': f"摄像头{active_index} (当前)",
         })
-    scan_max = max(1, int(_os.environ.get("YOLO_CAMERA_SCAN_MAX", "10")))
+    scan_max = max(1, int(_os.environ.get("YOLO_CAMERA_SCAN_MAX", "6")))
     for i in range(scan_max):
         if active_index is not None and i == int(active_index):
             continue
-        test_cap, backend = try_open_camera(i)
+        test_cap, backend = try_open_camera(i, verify=True)
         if test_cap.isOpened():
-            ret, _ = test_cap.read()
-            if ret:
-                backend_name = test_cap.getBackendName() if backend is not None else "default"
-                devices.append({
-                    'index': i,
-                    'label': f"摄像头{i} ({backend_name})",
-                })
-            test_cap.release()
+            backend_name = test_cap.getBackendName() if backend is not None else "default"
+            devices.append({
+                'index': i,
+                'label': f"摄像头{i} ({backend_name})",
+            })
+        test_cap.release()
     devices.sort(key=lambda item: item['index'])
     return devices
 
@@ -542,26 +701,34 @@ def get_cam_names(active_index=None):
 def open_cam(idx):
     cap, backend = try_open_camera(idx)
     target_w, target_h = 1280, 720
-    # MJPG and a one-frame buffer usually improve USB camera FPS and latency.
+    current_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else 0
+    current_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else 0
+    # DirectShow rebuilds its graph on FOURCC/height/FPS changes (several seconds
+    # per camera). Keep an already-HD native mode; only negotiate when resolution
+    # is genuinely below the requested monitoring quality.
+    if cap.isOpened() and (current_w < target_w or current_h < target_h):
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+        except Exception:
+            pass
     try:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
         pass
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
-    cap.set(cv2.CAP_PROP_FPS, 30)
     cap_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or target_w
     cap_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or target_h
-    # Keep automatic white balance and exposure enabled.
-    cap.set(cv2.CAP_PROP_AUTO_WB, 1)           # 自动白平衡
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # 自动曝光
-    cap_fps = 30  # 默认值
+    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+    cap_fps = 30
     if cap.isOpened():
         cap_fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         backend_name = cap.getBackendName() if backend is not None else "default"
         print(f"Camera {idx}: {cap_w}x{cap_h} @ ~{cap_fps}fps ({backend_name})")
     return cap, cap_w, cap_h, cap_fps
+
 
 def select_cam(idx):
     global cur, cap, cam_w, cam_h, cam_fps
@@ -578,6 +745,7 @@ def select_cam(idx):
     cur = idx
     if old_cap is not None and old_cap is not cap:
         old_cap.release()
+    reset_auto_snap_state()
     return True
 
 
@@ -602,6 +770,7 @@ def switch_cam(d, cam_names=None):
     cur = candidate
     if old_cap is not None and old_cap is not cap:
         old_cap.release()
+    reset_auto_snap_state()
 
 # ====== Mouse Clickable Buttons ======
 class Button:
@@ -755,78 +924,152 @@ def fit_complete_on_blur(frame, target_w, target_h):
 
 
 class CamCaptureThread(threading.Thread):
-    """独立采集线程：每路摄像头在各自线程里持续读帧，
-    按真实读帧节奏统计帧率（不再所有画面显示同一帧率）。"""
+    """每路摄像头独立采集；停止时绝不在 ``read`` 中途释放句柄。"""
     def __init__(self, cap, idx, label):
-        super().__init__(daemon=True)
+        super().__init__(name=f"camera-{idx}", daemon=True)
         self.cap = cap
         self.idx = idx
         self.label = label
         self._latest = None
         self._lock = threading.Lock()
+        self._cap_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._times = collections.deque(maxlen=30)
         self.fps = 0.0
-        self.running = True
         self.error = False
+        self._released = False
 
     def run(self):
-        while self.running:
+        while not self._stop_event.is_set():
             try:
                 t = time.time()
-                ret, frame = self.cap.read()
+                # release() from another thread while DirectShow is inside read()
+                # can terminate the whole Python process. Serialize both calls.
+                with self._cap_lock:
+                    if self._stop_event.is_set():
+                        break
+                    ret, frame = self.cap.read()
             except Exception:
                 ret, frame = False, None
             if ret and frame is not None and frame.size > 0:
                 with self._lock:
                     self._latest = frame
+                self.error = False
                 self._times.append(t)
                 n = len(self._times)
                 if n >= 2:
                     self.fps = (n - 1) / max(self._times[-1] - self._times[0], 1e-6)
             else:
                 self.error = True
-                time.sleep(0.02)
+                self._stop_event.wait(0.02)
 
     def get_frame(self):
         with self._lock:
             return None if self._latest is None else self._latest.copy()
 
-    def stop(self):
-        self.running = False
+    def request_stop(self):
+        self._stop_event.set()
+
+    def release_after_join(self):
+        if self.is_alive() or self._released:
+            return False
+        with self._cap_lock:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self._released = True
+        return True
+
+
+    def take_capture_after_join(self):
+        """Transfer ownership back to single-camera mode after the thread exits."""
+        if self.is_alive() or self._released:
+            return None
+        self._released = True
+        return self.cap
+
+
+def open_all_cameras(reuse_capture=None, reuse_index=None):
+    """启动多摄线程；复用当前单摄句柄，只打开其余摄像头。"""
+    global multi_threads, multi_cached_results
+    if multi_threads and not close_all_cameras():
+        return False
+
+    opened = []
+    for dev in list(cam_devices):
+        idx = dev['index']
+        if reuse_capture is not None and idx == reuse_index:
+            continue
+        camera_cap, _ = try_open_camera(idx)
+        if not camera_cap.isOpened():
+            continue
+        # Do not renegotiate FOURCC/height/FPS here: each DirectShow property can
+        # rebuild the graph and add 1-2 seconds. Native HD is resized only for UI.
         try:
-            self.cap.release()
+            camera_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
+        if _read_valid_camera_frame(camera_cap, min_valid=2, max_attempts=6,
+                                    delay=0.015) is None:
+            camera_cap.release()
+            print(f"多摄: 摄像头 {idx} 无有效画面，已跳过")
+            continue
+        opened.append(CamCaptureThread(camera_cap, idx, dev['label']))
 
+    total = len(opened) + (1 if reuse_capture is not None and reuse_capture.isOpened() else 0)
+    if total < 2:
+        for th in opened:
+            th.request_stop()
+            th.release_after_join()
+        print(f"多摄: 只成功打开 {total} 路，需要至少 2 路")
+        return False
 
-def open_all_cameras():
-    """为 cam_devices 中每个摄像头启动独立采集线程。"""
-    global multi_threads, multi_cached_results
-    close_all_cameras()
-    multi_threads = []
-    multi_cached_results = []
-    for dev in cam_devices:
-        idx = dev['index']
-        cap, _ = try_open_camera(idx)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            th = CamCaptureThread(cap, idx, dev['label'])
-            th.start()
-            multi_threads.append(th)
-            multi_cached_results.append(
-                {'boxes': np.empty((0, 4)), 'conf': np.array([]), 'cls': np.array([])})
-    print(f"多摄模式: 已打开 {len(multi_threads)} 个摄像头（独立采集线程）")
+    if reuse_capture is not None and reuse_capture.isOpened():
+        label = next((d['label'] for d in cam_devices if d['index'] == reuse_index),
+                     f"摄像头{reuse_index}")
+        opened.insert(0, CamCaptureThread(reuse_capture, reuse_index, label))
 
-
-def close_all_cameras():
-    """停止并释放所有多摄采集线程。"""
-    global multi_threads, multi_cached_results
+    multi_threads = opened
+    multi_cached_results = [
+        {'boxes': np.empty((0, 4)), 'conf': np.array([]), 'cls': np.array([])}
+        for _ in opened
+    ]
     for th in multi_threads:
-        th.stop()
+        th.start()
+    print(f"多摄模式: 已打开 {len(multi_threads)} 个摄像头（独立采集线程）")
+    return True
+
+
+def close_all_cameras(timeout=4.0, keep_index=None):
+    """安全停止全部线程；可把指定摄像头句柄直接交还单摄模式。"""
+    global multi_threads, multi_cached_results
+    threads = list(multi_threads)
+    if not threads:
+        multi_cached_results = []
+        return None if keep_index is not None else True
+
+    for th in threads:
+        th.request_stop()
+    deadline = time.monotonic() + timeout
+    for th in threads:
+        th.join(max(0.0, deadline - time.monotonic()))
+
+    stuck = [th for th in threads if th.is_alive()]
+    if stuck:
+        print("多摄: 摄像头线程停止超时，已取消切换以保护程序: " +
+              ", ".join(str(th.idx) for th in stuck))
+        return False
+
+    kept_capture = None
+    for th in threads:
+        if keep_index is not None and th.idx == keep_index and kept_capture is None:
+            kept_capture = th.take_capture_after_join()
+        else:
+            th.release_after_join()
     multi_threads = []
     multi_cached_results = []
+    return kept_capture if keep_index is not None else True
 
 
 def read_all_frames():
@@ -841,38 +1084,69 @@ def read_all_frames():
 
 
 def do_toggle_multi_cam():
-    """切换多摄平铺模式 / 单摄模式。"""
+    """稳定切换多摄/单摄；过滤连点并串行化所有摄像头资源变更。"""
     global multi_cam, _buttons_built_for_size, cap, cur, cam_w, cam_h, cam_fps
-    global multi_frame_counter
-    _buttons_built_for_size = None
+    global multi_frame_counter, camera_switching, last_multi_toggle_at
 
-    if not multi_cam:
-        # 单摄 → 多摄
-        if len(cam_devices) < 2:
-            print("多摄: 可用摄像头不足 2 个")
-            return
-        start_cam_transition()   # 冻结当前单摄画面作为淡出底图
-        # 释放当前单摄
-        try:
-            cap.release()
-        except:
-            pass
-        open_all_cameras()
-        if not multi_threads:
-            print("多摄: 无法打开任何摄像头")
-            # 重新打开原摄像头
+    now = time.monotonic()
+    if now - last_multi_toggle_at < MULTI_TOGGLE_DEBOUNCE:
+        print("多摄: 操作过快，已忽略重复点击")
+        return False
+    if camera_scan_running:
+        print("多摄: 正在扫描摄像头，请稍候再试")
+        return False
+    if not camera_transition_lock.acquire(blocking=False):
+        print("多摄: 上一次切换尚未完成")
+        return False
+
+    camera_switching = True
+    _buttons_built_for_size = None
+    try:
+        if not multi_cam:
+            if len(cam_devices) < 2:
+                print("多摄: 可用摄像头不足 2 个，请先刷新列表")
+                return False
+            start_cam_transition()
+            if not open_all_cameras(reuse_capture=cap, reuse_index=cur):
+                print("多摄: 打开失败，保持单摄")
+                return False
+            multi_cam = True
+            multi_frame_counter = 0
+            reset_auto_snap_state()
+            print(f"多摄模式: {len(multi_threads)} 个摄像头平铺")
+        else:
+            start_cam_transition()
+            kept_cap = close_all_cameras(keep_index=cur)
+            if kept_cap is False:
+                print("多摄: 线程尚未安全退出，保持多摄模式")
+                return False
+            if kept_cap is None or not kept_cap.isOpened():
+                print("多摄: 句柄交接失败，尝试重新打开单摄")
+                kept_cap, cam_w, cam_h, cam_fps = open_cam(cur)
+                if not kept_cap.isOpened():
+                    kept_cap.release()
+                    print("多摄: 单摄恢复失败，正在重新打开多摄")
+                    if open_all_cameras():
+                        multi_cam = True
+                    return False
+            cap = kept_cap
+            cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or OUTPUT_W
+            cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or OUTPUT_H
+            cam_fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+            multi_cam = False
+            reset_auto_snap_state()
+            print("已切回单摄模式")
+        return True
+    except Exception as exc:
+        print(f"多摄切换失败: {exc}")
+        if not multi_cam and (cap is None or not cap.isOpened()):
             cap, cam_w, cam_h, cam_fps = open_cam(cur)
-            return
-        multi_cam = True
-        multi_frame_counter = 0
-        print(f"多摄模式: {len(multi_threads)} 个摄像头平铺")
-    else:
-        # 多摄 → 单摄
-        start_cam_transition()   # 冻结当前多摄画面作为淡出底图
-        close_all_cameras()
-        multi_cam = False
-        cap, cam_w, cam_h, cam_fps = open_cam(cur)
-        print("已切回单摄模式")
+        return False
+    finally:
+        last_multi_toggle_at = time.monotonic()
+        camera_switching = False
+        _buttons_built_for_size = None
+        camera_transition_lock.release()
 
 
 # ====== 性能优化配置 ======
@@ -992,6 +1266,11 @@ cam_devices = [{'index': cur, 'label': f"摄像头{cur}"}]
 cam_names = [cam_devices[0]['label']]
 camera_scan_lock = threading.Lock()
 camera_scan_running = False
+camera_transition_lock = threading.Lock()
+camera_switching = False
+last_multi_toggle_at = 0.0
+MULTI_TOGGLE_DEBOUNCE = 0.8
+pending_actions_lock = threading.Lock()
 
 win = "YOLOv8"
 full = False
@@ -1005,7 +1284,9 @@ sel_page = 0
 paused = False
 show_help = False
 auto_snap = False  # 默认关闭自动拍照，避免开机即抓拍
-snap_cooldown = 10.0  # 人物检测拍照冷却时间（秒），避免连续拍照
+snap_cooldown = float(_os.environ.get("YOLO_SNAP_COOLDOWN", "10"))
+snap_max_interval = float(_os.environ.get("YOLO_SNAP_MAX_INTERVAL", "30"))
+snap_absence_reset = float(_os.environ.get("YOLO_SNAP_ABSENCE_RESET", "3"))
 last_snap_time = 0.0
 snap_flash = 0
 snap_mode = "crop"   # "crop" = 拍检测物体, "full" = 全屏拍照(带水印)
@@ -1023,6 +1304,11 @@ streamer = MJPEGStreamer(port=STREAM_PORT, quality=STREAM_QUALITY, fps_cap=STREA
                                              "remote": remote_url,
                                              "lan": streamer.url,
                                              "detection_enabled": detection_enabled,
+                                             "auto_snap": auto_snap,
+                                             "snapshot_count": snapshot_count,
+                                             "last_snapshot": Path(last_snap_path).name if last_snap_path else None,
+                                             "snapshot_dir": str(SNAP_DIR),
+                                             "camera_switching": camera_switching,
                                              "camera_count": len(cam_devices),
                                              "camera_indices": [d['index'] for d in cam_devices],
                                              "multi_camera": multi_cam,
@@ -1154,9 +1440,10 @@ def start_model_warm_async():
 # Model warmup is deferred until the first inference, after the window is visible.
 
 # 智能拍照：记录上次拍照的目标状态（位置+大小），用于判断是否需要补拍
-last_snap_target = None  # (cx, cy, w, h) 上次拍照时目标的中心点和尺寸
+last_snap_target = None  # (cx, cy, w, h) 最近一次自动抓拍目标
 snap_move_threshold = 0.25  # 目标移动超过画面25%或尺寸变化超过50%时补拍
 snap_size_threshold = 0.5
+auto_snap_states = {}       # 每个摄像头独立维护冷却、离场与周期补拍状态
 
 # Latest detection results (updated each loop for snapshot functions)
 g_frame = None
@@ -1222,7 +1509,7 @@ def do_select_cam(idx):
 def do_refresh_cameras():
     """Refresh camera cards in a worker thread so the preview stays responsive."""
     global camera_scan_running, _buttons_built_for_size
-    if multi_cam:
+    if multi_cam or camera_switching:
         return
     with camera_scan_lock:
         if camera_scan_running:
@@ -1234,7 +1521,7 @@ def do_refresh_cameras():
         global cam_devices, cam_names, camera_scan_running, _buttons_built_for_size
         try:
             found = get_camera_devices(active_index=cur)
-            if found:
+            if found and not multi_cam and not camera_switching:
                 cam_devices = found
                 cam_names = [device['label'] for device in found]
             print(f"可用摄像头: {len(cam_devices)}")
@@ -1269,6 +1556,7 @@ def do_toggle_detection():
         auto_snap = False
     else:
         start_model_warm_async()
+    reset_auto_snap_state()
     _buttons_built_for_size = None
     print("Detection mode: ON" if detection_enabled else "Monitor mode: ON (inference disabled)")
 
@@ -1303,8 +1591,12 @@ def do_toggle_help():
 
 def do_toggle_auto_snap():
     global auto_snap, _buttons_built_for_size
-    _buttons_built_for_size = None
+    # 自动拍照依赖识别；从监控模式开启时自动恢复识别，避免按钮显示开启却永远不拍。
+    if not auto_snap and not detection_enabled:
+        do_toggle_detection()
     auto_snap = not auto_snap
+    reset_auto_snap_state()
+    _buttons_built_for_size = None
     print(f"Auto-snap: {'ON' if auto_snap else 'OFF'}")
 
 
@@ -1567,7 +1859,9 @@ def build_buttons(w, h):
     global _buttons_built_for_size, _buttons_cache
 
     # 缓存按钮：只有当窗口大小或模式改变时才重建
-    cache_key = (w, h, sel, focus, auto_snap, snap_mode, full, paused, cur, len(cam_devices), recording, detection_enabled, camera_scan_running)
+    cache_key = (w, h, sel, focus, auto_snap, snap_mode, full, paused, cur,
+                 len(cam_devices), recording, detection_enabled, camera_scan_running,
+                 multi_cam, camera_switching)
     if _buttons_built_for_size == cache_key and _buttons_cache is not None:
         btn_mgr.buttons = _buttons_cache.copy()
         return
@@ -1703,8 +1997,11 @@ last_overlay_text_w = 0
 
 running = True
 while running:
-    while pending_main_actions:
-        _main_action = pending_main_actions.popleft()
+    while True:
+        with pending_actions_lock:
+            _main_action = pending_main_actions.popleft() if pending_main_actions else None
+        if _main_action is None:
+            break
         if _main_action == "multi_toggle":
             do_toggle_multi_cam()
     phone_frame_offered = False  # reset once per display loop
@@ -1760,6 +2057,8 @@ while running:
 
             # 绘制检测框（框在原始 tile 坐标，按显示缩放+偏移映射到画布）
             res = multi_cached_results[ti]
+            # 每路摄像头使用自己的原始画面、检测结果和冷却状态自动抓拍。
+            maybe_auto_snapshot(tile_frame, res, ("camera", th.idx), f"摄像头{th.idx}")
             if 'boxes' in res and res['boxes'] is not None and len(res['boxes']) > 0:
                 sx = new_w / max(fw, 1)
                 sy = new_h / max(fh, 1)
@@ -2129,78 +2428,9 @@ while running:
         ann = draw_cn(ann, res_str, (date_x, date_y2), 14, res_color, res_bg)
 
     # ====== Auto-snapshot ======
-    if detection_enabled and auto_snap and focus and focus_id >= 0 and not paused and not sel:
-        now_time = time.time()
-        # Check if target is present
-        target_present = False
-        best_crop = None
-        best_label = ""
-        best_conf = 0.0
-        best_score = -1.0
-        best_box = None  # (x1, y1, x2, y2)
-
-        # 统一获取检测数据
-        xyxy_list, conf_list, cls_list, track_id_list = get_boxes_data(boxes)
-
-        for i in range(len(xyxy_list)):
-            cid = int(cls_list[i])
-            if cid == focus_id:
-                x1, y1, x2, y2 = map(int, xyxy_list[i])
-                if not is_valid_person_box(x1, y1, x2, y2):
-                    continue
-                target_present = True
-                conf = conf_list[i]
-                track_id = int(track_id_list[i]) if i < len(track_id_list) else -1
-                track_bonus = 0.15 if track_id >= 0 else 0.0
-                score = conf + track_bonus + ((x2 - x1) * (y2 - y1)) / max(w * h, 1)
-                if score > best_score:
-                    best_score = score
-                    best_conf = conf
-                    margin = int((x2 - x1) * 0.15)
-                    cx1 = max(0, x1 - margin)
-                    cy1 = max(0, y1 - margin)
-                    cx2 = min(w, x2 + margin)
-                    cy2 = min(h, y2 + margin)
-                    best_crop = frame[cy1:cy2, cx1:cx2].copy()
-                    best_label = get_cn(all_names[cid])
-                    best_box = (x1, y1, x2, y2)
-
-        if target_present and best_crop is not None and best_conf >= PERSON_CONF:
-            # 智能判断是否需要补拍：检查目标是否大幅移动或尺寸大幅变化
-            should_snap = False
-            if (now_time - last_snap_time) > snap_cooldown:
-                if last_snap_target is None:
-                    should_snap = True
-                else:
-                    # 计算目标中心点移动距离（归一化）
-                    prev_cx, prev_cy, prev_w, prev_h = last_snap_target
-                    curr_cx = (best_box[0] + best_box[2]) / 2
-                    curr_cy = (best_box[1] + best_box[3]) / 2
-                    curr_w = best_box[2] - best_box[0]
-                    curr_h = best_box[3] - best_box[1]
-
-                    # 归一化移动距离
-                    move_dist = (((curr_cx - prev_cx) / w) ** 2 + ((curr_cy - prev_cy) / h) ** 2) ** 0.5
-                    # 尺寸变化比例
-                    prev_area = prev_w * prev_h
-                    curr_area = curr_w * curr_h
-                    size_change = abs(curr_area - prev_area) / max(prev_area, 1)
-
-                    if move_dist > snap_move_threshold or size_change > snap_size_threshold:
-                        should_snap = True
-
-            if should_snap:
-                snap_frame = frame if snap_mode == "full" else best_crop
-                if save_snapshot(snap_frame, best_label, best_conf, full_frame=(snap_mode == "full")):
-                    last_snap_time = now_time
-                    snap_flash = 12
-                    # 记录当前目标状态
-                    last_snap_target = (
-                        (best_box[0] + best_box[2]) / 2,
-                        (best_box[1] + best_box[3]) / 2,
-                        best_box[2] - best_box[0],
-                        best_box[3] - best_box[1]
-                    )
+    # 多摄模式已在每个 tile 内分别处理；单摄使用当前原始帧与当前检测结果。
+    if not multi_cam:
+        maybe_auto_snapshot(frame, boxes, ("camera", cur), f"摄像头{cur}")
 
     # Flash effect
     if snap_flash > 0:
@@ -2327,6 +2557,7 @@ if 'tunnel' in globals() and tunnel is not None:
     except Exception:
         pass
 streamer.stop()
+close_all_cameras()
 if tray_icon is not None:
     try:
         tray_icon.stop()
