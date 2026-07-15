@@ -44,8 +44,17 @@ for _cand in _MODEL_CANDIDATES:
 if model_path is None:
     model_path = BASE_DIR / "models" / "yolov8n.pt"
 
-print(f"Loading model: {model_path}")
+print(f"Loading detection model: {model_path}")
 model = YOLO(str(model_path))
+POSE_MODEL_PATH = BASE_DIR / "models" / "yolov8n-pose.pt"
+POSE_MODEL_NAME = "yolov8n-pose.pt"
+pose_model = None
+pose_model_ready = False
+pose_model_loading = False
+pose_load_error = None
+pose_load_lock = threading.Lock()
+pose_people_count = 0
+pose_visible_keypoints = 0
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -83,6 +92,30 @@ def get_font(size):
     if key not in _font_cache:
         _font_cache[key] = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
     return _font_cache[key]
+
+
+def text_pixel_width(text, size):
+    bbox = get_font(size).getbbox(str(text))
+    return max(0, bbox[2] - bbox[0])
+
+
+def ellipsize_text(text, max_width, size):
+    text = str(text)
+    if max_width <= 0:
+        return ""
+    if text_pixel_width(text, size) <= max_width:
+        return text
+    suffix = "..."
+    if text_pixel_width(suffix, size) > max_width:
+        return ""
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if text_pixel_width(text[:mid] + suffix, size) <= max_width:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low] + suffix
 
 
 def draw_cn(img, text, pos, size=18, color=(0, 255, 0), bg=None, anchor="lt"):
@@ -220,6 +253,14 @@ all_names = model.names
 PERSON_CN = "人"
 PERSON_CONF = 0.50   # 降低阈值以提升识别率（更少漏检）
 PERSON_IOU = 0.45
+POSE_KEYPOINT_CONF = 0.25
+COCO_POSE_SKELETON = (
+    (15, 13), (13, 11), (16, 14), (14, 12),
+    (11, 12), (5, 11), (6, 12), (5, 6),
+    (5, 7), (6, 8), (7, 9), (8, 10),
+    (1, 2), (0, 1), (0, 2), (1, 3),
+    (2, 4), (3, 5), (4, 6),
+)
 MIN_PERSON_BOX_AREA = 18000
 MIN_PERSON_BOX_HEIGHT = 160
 
@@ -307,6 +348,12 @@ def phone_command(action):
                 pending_main_actions.append("multi_toggle")
                 return "multi queued"
         return "multi busy"
+    elif action == "pose_toggle":
+        with pending_actions_lock:
+            if "pose_toggle" not in pending_main_actions:
+                pending_main_actions.append("pose_toggle")
+                return "pose queued"
+        return "pose busy"
     elif action == "auto_snap_toggle":
         do_toggle_auto_snap()
         return "auto snap on" if auto_snap else "auto snap off"
@@ -436,6 +483,120 @@ def get_boxes_data(boxes):
     if getattr(boxes, 'id', None) is not None:
         track_ids = boxes.id.int().cpu().tolist()
     return boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist(), track_ids
+
+
+def empty_inference_cache():
+    return {
+        'xyxy': np.empty((0, 4)),
+        'conf': np.array([]),
+        'cls': np.array([]),
+        'track_id': np.array([]),
+        'keypoints': np.empty((0, 17, 2)),
+        'keypoint_conf': np.empty((0, 17)),
+    }
+
+
+def result_to_cache(result):
+    cache = empty_inference_cache()
+    boxes = getattr(result, 'boxes', None)
+    if boxes is not None and len(boxes) > 0:
+        cache['xyxy'] = boxes.xyxy.clone().cpu().numpy()
+        cache['conf'] = boxes.conf.clone().cpu().numpy()
+        cache['cls'] = boxes.cls.clone().cpu().numpy()
+        if getattr(boxes, 'id', None) is not None:
+            cache['track_id'] = boxes.id.int().cpu().numpy()
+
+    keypoints = getattr(result, 'keypoints', None)
+    if keypoints is not None and len(keypoints) > 0:
+        cache['keypoints'] = keypoints.xy.clone().cpu().numpy()
+        keypoint_conf = getattr(keypoints, 'conf', None)
+        if keypoint_conf is not None:
+            cache['keypoint_conf'] = keypoint_conf.clone().cpu().numpy()
+        else:
+            cache['keypoint_conf'] = np.ones(cache['keypoints'].shape[:2], dtype=np.float32)
+    return cache
+
+
+def get_pose_metrics(cache):
+    if not isinstance(cache, dict):
+        return 0, 0
+    keypoints = np.asarray(cache.get('keypoints', []))
+    if keypoints.ndim != 3 or len(keypoints) == 0:
+        return 0, 0
+    scores = np.asarray(cache.get('keypoint_conf', []))
+    valid_xy = (keypoints[..., 0] > 0) & (keypoints[..., 1] > 0)
+    if scores.shape == valid_xy.shape:
+        valid_xy &= scores >= POSE_KEYPOINT_CONF
+    return int(len(keypoints)), int(np.count_nonzero(valid_xy))
+
+
+def draw_pose_skeleton(img, keypoints, keypoint_conf=None, transform=None):
+    if keypoints is None or len(keypoints) == 0:
+        return img
+    points = np.asarray(keypoints)
+    scores = None if keypoint_conf is None else np.asarray(keypoint_conf)
+    for person_idx, person_points in enumerate(points):
+        if len(person_points) < 17:
+            continue
+        person_scores = scores[person_idx] if scores is not None and person_idx < len(scores) else None
+        visible = []
+        for point_idx, point in enumerate(person_points):
+            confidence = float(person_scores[point_idx]) if person_scores is not None and point_idx < len(person_scores) else 1.0
+            if confidence < POSE_KEYPOINT_CONF or float(point[0]) <= 0 or float(point[1]) <= 0:
+                visible.append(None)
+                continue
+            x, y = float(point[0]), float(point[1])
+            if transform is not None:
+                x, y = transform(x, y)
+            visible.append((int(round(x)), int(round(y))))
+        for start, end in COCO_POSE_SKELETON:
+            if visible[start] is not None and visible[end] is not None:
+                cv2.line(img, visible[start], visible[end], (0, 210, 255), 2, cv2.LINE_AA)
+        for point in visible:
+            if point is not None:
+                cv2.circle(img, point, 3, (70, 70, 255), -1, cv2.LINE_AA)
+    return img
+
+
+def active_inference_model():
+    return pose_model if pose_enabled and pose_model is not None else model
+
+
+def active_model_ready():
+    return pose_model_ready if pose_enabled else model_warmed
+
+
+def current_recognition_name():
+    return "人体姿态" if pose_enabled else "人体识别"
+
+
+def load_pose_model():
+    """Load the lightweight YOLO pose model, downloading it on first use."""
+    global pose_model, pose_load_error
+    if pose_model is not None:
+        return pose_model
+    try:
+        POSE_MODEL_PATH.parent.mkdir(exist_ok=True)
+        if POSE_MODEL_PATH.exists():
+            source = str(POSE_MODEL_PATH)
+        else:
+            source = POSE_MODEL_NAME
+        print(f"Loading pose model: {source}")
+        pose_model = YOLO(source)
+        # Ultralytics downloads named assets into the current working directory.
+        # Move that first-use download into models/ so subsequent starts are offline.
+        downloaded = Path(source).resolve() if source == POSE_MODEL_NAME else None
+        if downloaded is not None and downloaded.exists() and not POSE_MODEL_PATH.exists():
+            try:
+                downloaded.replace(POSE_MODEL_PATH)
+            except Exception:
+                pass
+        pose_load_error = None
+        return pose_model
+    except Exception as exc:
+        pose_load_error = str(exc)
+        print(f"Pose model load failed: {exc}")
+        return None
 
 
 def is_valid_person_box(x1, y1, x2, y2):
@@ -1031,10 +1192,7 @@ def open_all_cameras(reuse_capture=None, reuse_index=None):
         opened.insert(0, CamCaptureThread(reuse_capture, reuse_index, label))
 
     multi_threads = opened
-    multi_cached_results = [
-        {'boxes': np.empty((0, 4)), 'conf': np.array([]), 'cls': np.array([])}
-        for _ in opened
-    ]
+    multi_cached_results = [empty_inference_cache() for _ in opened]
     for th in multi_threads:
         th.start()
     print(f"多摄模式: 已打开 {len(multi_threads)} 个摄像头（独立采集线程）")
@@ -1156,9 +1314,14 @@ INFER_SIZE = 640
 INFER_EVERY_N = 1 if device == "cuda" else 2
 # 多摄每路推理尺寸（每帧要跑多路，故偏小保证整体流畅）
 MULTI_INFER_SIZE = 416 if device == "cuda" else 320
+POSE_INFER_SIZE = 640 if device == "cuda" else 416
+MULTI_POSE_INFER_SIZE = 384 if device == "cuda" else 320
 # 使用半精度推理（需 GPU 支持）
 USE_HALF = device == "cuda"
 OUTPUT_W, OUTPUT_H = 1280, 720
+MULTI_TOP_BAR_H = 54
+MULTI_CONTROL_W = 112
+MULTI_TILE_INFO_H = 46
 PHONE_STACK_W = 960      # 手机端多摄竖排时每路画面的宽度（竖排避免平铺过小）
 PHONE_INFO_PANEL = _os.environ.get("YOLO_PHONE_PANEL", "0").lower() in {"1", "true", "yes", "on"}
 STREAM_FPS = int(_os.environ.get("YOLO_STREAM_FPS", "30"))
@@ -1278,6 +1441,7 @@ focus = True           # 默认专注模式：只识别人
 focus_cn = PERSON_CN
 focus_id = find_cid(PERSON_CN)
 detection_enabled = not (_os.environ.get("YOLO_START_MONITOR", "0").lower() in {"1", "true", "yes", "on"})  # False = pure monitoring
+pose_enabled = False       # True = use YOLO pose keypoints instead of box-only detection
 inp = ""
 sel = False
 sel_page = 0
@@ -1304,6 +1468,13 @@ streamer = MJPEGStreamer(port=STREAM_PORT, quality=STREAM_QUALITY, fps_cap=STREA
                                              "remote": remote_url,
                                              "lan": streamer.url,
                                              "detection_enabled": detection_enabled,
+                                             "pose_enabled": pose_enabled,
+                                             "pose_ready": pose_model_ready,
+                                             "pose_loading": pose_model_loading,
+                                             "pose_error": pose_load_error,
+                                             "pose_people": pose_people_count,
+                                             "pose_keypoints": pose_visible_keypoints,
+                                             "recognition_mode": "pose" if pose_enabled else ("detect" if detection_enabled else "monitor"),
                                              "auto_snap": auto_snap,
                                              "snapshot_count": snapshot_count,
                                              "last_snapshot": Path(last_snap_path).name if last_snap_path else None,
@@ -1437,6 +1608,49 @@ def start_model_warm_async():
 
     threading.Thread(target=worker, name="model-warmup", daemon=True).start()
 
+
+def start_pose_warm_async():
+    """Load/download and warm the pose model without blocking camera preview."""
+    global pose_model_loading, pose_load_error
+    with pose_load_lock:
+        if pose_model_ready or pose_model_loading:
+            return
+        pose_model_loading = True
+        pose_load_error = None
+
+    def worker():
+        global pose_model_ready, pose_model_loading, pose_load_error
+        try:
+            pm = load_pose_model()
+            if pm is None:
+                raise RuntimeError(pose_load_error or "姿态模型加载失败")
+            print("Warming up pose model in background...")
+            dummy = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
+            pm.predict(
+                dummy,
+                imgsz=POSE_INFER_SIZE,
+                verbose=False,
+                half=USE_HALF,
+                classes=[0],
+                conf=PERSON_CONF,
+                iou=PERSON_IOU,
+            )
+            with pose_load_lock:
+                pose_model_ready = True
+                pose_load_error = None
+            print("Pose model ready.")
+        except Exception as exc:
+            with pose_load_lock:
+                pose_model_ready = False
+                pose_load_error = str(exc)
+            print(f"Pose model warmup failed: {exc}")
+        finally:
+            with pose_load_lock:
+                pose_model_loading = False
+
+    threading.Thread(target=worker, name="pose-model-warmup", daemon=True).start()
+
+
 # Model warmup is deferred until the first inference, after the window is visible.
 
 # 智能拍照：记录上次拍照的目标状态（位置+大小），用于判断是否需要补拍
@@ -1534,31 +1748,55 @@ def do_refresh_cameras():
 
     threading.Thread(target=worker, name="camera-scan", daemon=True).start()
 
-def do_toggle_detection():
-    global detection_enabled, cached_boxes, g_boxes
-    global locked_track_id, locked_box, locked_conf, locked_misses
-    global auto_snap, _buttons_built_for_size, multi_cached_results
-    detection_enabled = not detection_enabled
-    cached_boxes = {
-        'xyxy': np.empty((0, 4)), 'conf': np.array([]),
-        'cls': np.array([]), 'track_id': np.array([]),
-    }
+def clear_inference_state():
+    global cached_boxes, g_boxes, locked_track_id, locked_box, locked_conf, locked_misses
+    global multi_cached_results, _first_inference_logged, frame_counter, multi_frame_counter
+    global pose_people_count, pose_visible_keypoints
+    cached_boxes = empty_inference_cache()
     g_boxes = cached_boxes
+    multi_cached_results = [empty_inference_cache() for _ in multi_cached_results]
     locked_track_id = None
     locked_box = None
     locked_conf = 0.0
     locked_misses = 0
-    multi_cached_results = [
-        {'boxes': np.empty((0, 4)), 'conf': np.array([]), 'cls': np.array([])}
-        for _ in multi_cached_results
-    ]
+    frame_counter = 0
+    multi_frame_counter = 0
+    _first_inference_logged = False
+    pose_people_count = 0
+    pose_visible_keypoints = 0
+    reset_auto_snap_state()
+
+
+def do_toggle_detection():
+    global detection_enabled, auto_snap, _buttons_built_for_size
+    detection_enabled = not detection_enabled
+    clear_inference_state()
     if not detection_enabled:
         auto_snap = False
+    elif pose_enabled:
+        start_pose_warm_async()
     else:
         start_model_warm_async()
-    reset_auto_snap_state()
     _buttons_built_for_size = None
     print("Detection mode: ON" if detection_enabled else "Monitor mode: ON (inference disabled)")
+
+
+def do_toggle_pose():
+    global pose_enabled, detection_enabled, _buttons_built_for_size
+    # Pose inference replaces box-only inference, so enabling it does not double
+    # GPU workload. The pose model still provides person boxes for snapshots.
+    if not pose_enabled and not detection_enabled:
+        detection_enabled = True
+    pose_enabled = not pose_enabled
+    clear_inference_state()
+    if detection_enabled:
+        if pose_enabled:
+            start_pose_warm_async()
+        else:
+            start_model_warm_async()
+    _buttons_built_for_size = None
+    state = "ON" if pose_enabled else "OFF"
+    print(f"Pose recognition: {state}")
 
 
 def do_toggle_focus():
@@ -1861,7 +2099,8 @@ def build_buttons(w, h):
     # 缓存按钮：只有当窗口大小或模式改变时才重建
     cache_key = (w, h, sel, focus, auto_snap, snap_mode, full, paused, cur,
                  len(cam_devices), recording, detection_enabled, camera_scan_running,
-                 multi_cam, camera_switching)
+                 multi_cam, camera_switching, pose_enabled, pose_model_loading,
+                 pose_model_ready)
     if _buttons_built_for_size == cache_key and _buttons_cache is not None:
         btn_mgr.buttons = _buttons_cache.copy()
         return
@@ -1929,6 +2168,7 @@ def build_buttons(w, h):
     fn_start_y = h - btn_h - 8
     fn_labels = [
         ("切到监控" if detection_enabled else "开启识别", do_toggle_detection, not detection_enabled, (46, 132, 104), False),
+        ("姿态加载中" if pose_model_loading else ("关闭姿态" if pose_enabled else "姿态识别"), do_toggle_pose, pose_enabled, (40, 126, 164), False),
         ("拍照", do_manual_snap, True, (56, 132, 92), False),
         ("手机投屏", do_toggle_stream_qr, show_stream_qr, (48, 118, 148), False),
         ("录制" if not recording else "停止录", toggle_recording, recording, (168, 64, 64), False),
@@ -1985,7 +2225,7 @@ print("  Q:Quit  F:Fullscreen  C/X:Backup camera switch  P:Pause")
 print("  Click left camera cards to choose a working camera")
 print("  Use the refresh button to rescan camera devices")
 print("  1:Lock person  H:Help  Space:Snapshot  R:Record  B:QR target")
-print("  M:Snapshot mode  V:Toggle phone panel  D:Detection/Monitor")
+print("  M:Snapshot mode  V:Toggle phone panel  D:Detection/Monitor  K:Pose")
 print("====================\n")
 
 # 实时帧率追踪
@@ -2004,101 +2244,128 @@ while running:
             break
         if _main_action == "multi_toggle":
             do_toggle_multi_cam()
+        elif _main_action == "pose_toggle":
+            do_toggle_pose()
     phone_frame_offered = False  # reset once per display loop
     # ====== 多摄像头平铺模式（跳过单摄读取） ======
     phone_canvas = None   # 手机端专用画面（默认 None，下面分支会赋值）
     if multi_cam:
         phone_canvas = None   # 手机端专用画面（干净、无桌面 UI），多摄时上下竖排
         phone_stack = []      # 多摄各路的干净画面，竖排拼接用
+        pose_people_count = 0
+        pose_visible_keypoints = 0
         multi_frame_counter += 1
-        multi_do_infer = detection_enabled and model_warmed and (multi_frame_counter % MULTI_TILE_INFER_N == 0)
+        multi_infer_interval = 3 if pose_enabled else MULTI_TILE_INFER_N
+        multi_do_infer = detection_enabled and active_model_ready() and (multi_frame_counter % multi_infer_interval == 0)
         raw_frames = read_all_frames()
+        if multi_do_infer and raw_frames:
+            try:
+                # Batch all cameras into one GPU call. This avoids per-camera
+                # framework overhead and keeps remote pose video visibly smoother.
+                inference_model = active_inference_model()
+                batch_results = inference_model.predict(
+                    raw_frames,
+                    imgsz=MULTI_POSE_INFER_SIZE if pose_enabled else MULTI_INFER_SIZE,
+                    verbose=False,
+                    half=USE_HALF,
+                    classes=[0 if pose_enabled else focus_id],
+                    conf=PERSON_CONF,
+                    iou=PERSON_IOU,
+                )
+                for _ri, _result in enumerate(batch_results[:len(multi_cached_results)]):
+                    multi_cached_results[_ri] = result_to_cache(_result)
+            except Exception as exc:
+                multi_cached_results = [empty_inference_cache() for _ in multi_cached_results]
+                if multi_frame_counter % 60 == 0:
+                    print(f"Multi-camera batch inference failed: {exc}")
         rows, cols = calc_grid(len(multi_threads))
-        tile_w = OUTPUT_W // cols
-        tile_h = OUTPUT_H // rows
-        canvas = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
+        grid_w = OUTPUT_W - MULTI_CONTROL_W
+        grid_h = OUTPUT_H - MULTI_TOP_BAR_H
+        canvas = np.full((OUTPUT_H, OUTPUT_W, 3), (16, 18, 22), dtype=np.uint8)
+        cv2.line(canvas, (grid_w, MULTI_TOP_BAR_H), (grid_w, OUTPUT_H), (54, 58, 66), 1)
 
         for ti, th in enumerate(multi_threads):
             r = ti // cols
             c = ti % cols
-            tx = c * tile_w
-            ty = r * tile_h
+            tx = c * grid_w // cols
+            ty = MULTI_TOP_BAR_H + r * grid_h // rows
+            tile_x2 = (c + 1) * grid_w // cols
+            tile_y2 = MULTI_TOP_BAR_H + (r + 1) * grid_h // rows
+            tile_w = tile_x2 - tx
+            tile_h = tile_y2 - ty
+            content_y = ty + MULTI_TILE_INFO_H
+            content_h = max(1, tile_h - MULTI_TILE_INFO_H)
             tile_frame = raw_frames[ti]
             label = th.label
             # 保持宽高比缩放 + 黑边填充（letterbox）
             fh, fw = tile_frame.shape[:2]
             tile_area, scale, ox, oy, new_w, new_h = fit_complete_on_blur(
-                tile_frame, tile_w, tile_h)
-            canvas[ty:ty+tile_h, tx:tx+tile_w] = tile_area
-
-            if multi_do_infer:
-                try:
-                    # 用 predict 直接返回原图坐标系下的框，避免跨摄像头 tracker 串号
-                    tresults = model.predict(
-                        tile_frame,
-                        imgsz=MULTI_INFER_SIZE,
-                        verbose=False,
-                        half=USE_HALF,
-                        classes=[focus_id],
-                        conf=PERSON_CONF,
-                        iou=PERSON_IOU,
-                    )
-                    tboxes = tresults[0].boxes
-                    if len(tboxes) > 0:
-                        txyxy = tboxes.xyxy.clone().cpu().numpy()
-                        tconf = tboxes.conf.clone().cpu().numpy()
-                        tcls = tboxes.cls.clone().cpu().numpy()
-                    else:
-                        txyxy, tconf, tcls = np.empty((0, 4)), np.array([]), np.array([])
-                    multi_cached_results[ti] = {'boxes': txyxy, 'conf': tconf, 'cls': tcls}
-                except Exception:
-                    multi_cached_results[ti] = {'boxes': np.empty((0, 4)),
-                                               'conf': np.array([]), 'cls': np.array([])}
+                tile_frame, tile_w, content_h)
+            canvas[content_y:tile_y2, tx:tile_x2] = tile_area
 
             # 绘制检测框（框在原始 tile 坐标，按显示缩放+偏移映射到画布）
             res = multi_cached_results[ti]
+            if pose_enabled:
+                _pose_people, _pose_points = get_pose_metrics(res)
+                pose_people_count += _pose_people
+                pose_visible_keypoints += _pose_points
             # 每路摄像头使用自己的原始画面、检测结果和冷却状态自动抓拍。
             maybe_auto_snapshot(tile_frame, res, ("camera", th.idx), f"摄像头{th.idx}")
-            if 'boxes' in res and res['boxes'] is not None and len(res['boxes']) > 0:
-                sx = new_w / max(fw, 1)
-                sy = new_h / max(fh, 1)
-                for bi in range(len(res['boxes'])):
-                    x1, y1, x2, y2 = map(int, res['boxes'][bi])
+            sx = new_w / max(fw, 1)
+            sy = new_h / max(fh, 1)
+            if 'xyxy' in res and res['xyxy'] is not None and len(res['xyxy']) > 0:
+                for bi in range(len(res['xyxy'])):
+                    x1, y1, x2, y2 = map(int, res['xyxy'][bi])
                     conf = float(res['conf'][bi]) if len(res['conf']) > bi else 0
                     x1 = int(x1 * sx) + tx + ox
-                    y1 = int(y1 * sy) + ty + oy
+                    y1 = int(y1 * sy) + content_y + oy
                     x2 = int(x2 * sx) + tx + ox
-                    y2 = int(y2 * sy) + ty + oy
+                    y2 = int(y2 * sy) + content_y + oy
                     cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 220, 120), 2)
-                    canvas = draw_cn(canvas, f"人 {conf:.2f}", (x1 + 4, y1 - 6), 12, (0, 0, 0), (0, 220, 120))
+                    label_y = max(content_y + 16, y1 - 6)
+                    canvas = draw_cn(canvas, f"人 {conf:.2f}", (x1 + 4, label_y), 12, (0, 0, 0), (0, 220, 120))
+            if pose_enabled:
+                def _desktop_pose_transform(px, py, _sx=sx, _sy=sy,
+                                            _tx=tx + ox, _ty=content_y + oy):
+                    return px * _sx + _tx, py * _sy + _ty
+                draw_pose_skeleton(canvas, res.get('keypoints'),
+                                   res.get('keypoint_conf'), _desktop_pose_transform)
 
             # 手机端专用干净画面：仅摄像头+检测框，不带桌面 UI（按钮/标题/信息面板）。
             # 多摄时改为上下竖排，避免平铺导致每路画面过小、看不清。
             _pt = tile_frame.copy()
-            if 'boxes' in res and res['boxes'] is not None and len(res['boxes']) > 0:
-                for bi in range(len(res['boxes'])):
-                    _bx1, _by1, _bx2, _by2 = map(int, res['boxes'][bi])
+            if 'xyxy' in res and res['xyxy'] is not None and len(res['xyxy']) > 0:
+                for bi in range(len(res['xyxy'])):
+                    _bx1, _by1, _bx2, _by2 = map(int, res['xyxy'][bi])
                     cv2.rectangle(_pt, (_bx1, _by1), (_bx2, _by2), (0, 220, 120), 2)
                     _conf = float(res['conf'][bi]) if len(res['conf']) > bi else 0
                     _pt = draw_cn(_pt, f"人 {_conf:.2f}", (_bx1 + 4, _by1 - 6), 12, (0, 0, 0), (0, 220, 120))
+            if pose_enabled:
+                draw_pose_skeleton(_pt, res.get('keypoints'), res.get('keypoint_conf'))
             _ps = PHONE_STACK_W / max(fw, 1)
             _pt = cv2.resize(_pt, (PHONE_STACK_W, int(fh * _ps)), interpolation=cv2.INTER_LINEAR)
             phone_stack.append(_pt)
 
-            # 摄像头信息：标签 + 时间 + 分辨率 + 各路独立帧率
-            cv2.rectangle(canvas, (tx, ty), (tx + 196, ty + 44), (0, 0, 0), -1)
-            canvas = draw_cn(canvas, label, (tx + 4, ty + 2), 13, (0, 255, 0))
+            # 摄像头信息：两行独立栏，名称/分辨率在左，时间/帧率在右。
+            cv2.rectangle(canvas, (tx, ty), (tile_x2 - 1, content_y - 1), (24, 28, 34), -1)
+            cv2.line(canvas, (tx, content_y - 1), (tile_x2 - 1, content_y - 1), (72, 78, 88), 1)
             multi_now = datetime.datetime.now()
             time_str = multi_now.strftime("%H:%M:%S")
-            canvas = draw_cn(canvas, time_str, (tx + tile_w - 6, ty + 2), 12, (255, 255, 200), anchor="rt")
+            time_w = text_pixel_width(time_str, 12)
+            label_max_w = max(20, tile_w - time_w - 26)
+            label_txt = ellipsize_text(label, label_max_w, 13)
+            canvas = draw_cn(canvas, label_txt, (tx + 8, ty + 3), 13, (90, 245, 150))
+            canvas = draw_cn(canvas, time_str, (tile_x2 - 8, ty + 3), 12,
+                             (235, 235, 215), anchor="rt")
             cap_w_ = int(th.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or fw
             cap_h_ = int(th.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or fh
             res_str = f"{cap_w_}x{cap_h_}"
             fps_val = th.fps
-            info_str = f"{res_str}  {fps_val:.1f}fps"
-            canvas = draw_cn(canvas, info_str, (tx + 4, ty + 22), 11, (200, 200, 200))
-            if th.error:
-                canvas = draw_cn(canvas, "无信号", (tx + 4, ty + 38), 11, (255, 120, 120))
+            status_str = "无信号" if th.error else f"{fps_val:.1f} FPS"
+            status_color = (120, 160, 255) if th.error else (90, 230, 255)
+            canvas = draw_cn(canvas, res_str, (tx + 8, ty + 24), 11, (190, 196, 205))
+            canvas = draw_cn(canvas, status_str, (tile_x2 - 8, ty + 24), 11,
+                             status_color, anchor="rt")
 
         # 手机端多摄画面（干净、无桌面 UI）
         if streamer.phone_layout == "tile":
@@ -2116,15 +2383,22 @@ while running:
                 _tile, _s, _ox, _oy, _nw, _nh = fit_complete_on_blur(_f, _tw, _th)
                 pt_canvas[_ty:_ty + _th, _tx:_tx + _tw] = _tile
                 _res = multi_cached_results[ti]
-                if 'boxes' in _res and _res['boxes'] is not None and len(_res['boxes']) > 0:
+                if 'xyxy' in _res and _res['xyxy'] is not None and len(_res['xyxy']) > 0:
                     _sx, _sy = _nw / max(fw, 1), _nh / max(fh, 1)
-                    for bi in range(len(_res['boxes'])):
-                        x1, y1, x2, y2 = map(int, _res['boxes'][bi])
+                    for bi in range(len(_res['xyxy'])):
+                        x1, y1, x2, y2 = map(int, _res['xyxy'][bi])
                         x1 = int(x1 * _sx) + _tx + _ox
                         y1 = int(y1 * _sy) + _ty + _oy
                         x2 = int(x2 * _sx) + _tx + _ox
                         y2 = int(y2 * _sy) + _ty + _oy
                         cv2.rectangle(pt_canvas, (x1, y1), (x2, y2), (0, 220, 120), 2)
+                if pose_enabled:
+                    def _phone_tile_pose_transform(px, py, __sx=_nw / max(fw, 1),
+                                                   __sy=_nh / max(fh, 1),
+                                                   __tx=_tx + _ox, __ty=_ty + _oy):
+                        return px * __sx + __tx, py * __sy + __ty
+                    draw_pose_skeleton(pt_canvas, _res.get('keypoints'),
+                                       _res.get('keypoint_conf'), _phone_tile_pose_transform)
             phone_canvas = pt_canvas
         else:
             # 竖屏：上下竖排拼接（无桌面 UI）
@@ -2179,47 +2453,39 @@ while running:
 
         frame_counter += 1
         # 跳帧推理：只在指定间隔推理，中间帧复用缓存
-        do_infer = detection_enabled and model_warmed and (frame_counter % INFER_EVERY_N == 0)
+        do_infer = detection_enabled and active_model_ready() and (frame_counter % INFER_EVERY_N == 0)
 
         if do_infer:
             if not _first_inference_logged:
                 print("First live inference started.")
             _infer_t0 = time.perf_counter()
-            # 直接传入整帧并指定 imgsz：ultralytics 返回原图坐标系下的框，无需手动缩放
-            results = model.track(
+            # 姿态模式直接替代框检测，避免同时跑两个模型造成帧率下降。
+            inference_model = active_inference_model()
+            results = inference_model.track(
                 frame,
-                imgsz=INFER_SIZE,
+                imgsz=POSE_INFER_SIZE if pose_enabled else INFER_SIZE,
                 verbose=False,
                 half=USE_HALF,
                 persist=True,
                 tracker="bytetrack.yaml",
-                classes=[focus_id],
+                classes=[0 if pose_enabled else focus_id],
                 conf=PERSON_CONF,
                 iou=PERSON_IOU,
             )
             if not _first_inference_logged:
-                print(f"First live inference finished in {(time.perf_counter() - _infer_t0) * 1000:.1f} ms.")
+                mode_name = "pose" if pose_enabled else "detect"
+                print(f"First {mode_name} inference finished in {(time.perf_counter() - _infer_t0) * 1000:.1f} ms.")
                 _first_inference_logged = True
-            boxes = results[0].boxes
-            if len(boxes) > 0:
-                track_id = []
-                if getattr(boxes, 'id', None) is not None:
-                    track_id = boxes.id.int().cpu().numpy()
-                cached_boxes = {
-                    'xyxy': boxes.xyxy.clone().cpu().numpy(),
-                    'conf': boxes.conf.clone().cpu().numpy() if len(boxes.conf) > 0 else np.array([]),
-                    'cls': boxes.cls.clone().cpu().numpy() if len(boxes.cls) > 0 else np.array([]),
-                    'track_id': track_id,
-                }
-            else:
-                cached_boxes = {
-                    'xyxy': np.empty((0, 4)),
-                    'conf': np.array([]),
-                    'cls': np.array([]),
-                    'track_id': np.array([]),
-                }
+            cached_boxes = result_to_cache(results[0])
+            boxes = cached_boxes
         else:
             boxes = cached_boxes
+
+        if pose_enabled:
+            pose_people_count, pose_visible_keypoints = get_pose_metrics(boxes)
+        else:
+            pose_people_count = 0
+            pose_visible_keypoints = 0
 
         g_frame = frame.copy()
         g_boxes = boxes
@@ -2305,6 +2571,9 @@ while running:
             ann = draw_cn(ann, label, (x1 + 2, y1 - 24), 16,
                           (255, 255, 255) if is_locked else (210, 210, 210), color)
 
+        if pose_enabled and isinstance(boxes, dict):
+            draw_pose_skeleton(ann, boxes.get('keypoints'), boxes.get('keypoint_conf'))
+
         # 手机端专用画面：竖屏自适应——摄像头居中，上下留白区显示识别统计。
         # 仅在有手机观看时才合成，避免无人观看时白白消耗 CPU。
         if not phone_frame_offered:
@@ -2342,31 +2611,57 @@ while running:
 
     if show_desktop:
         # ====== Normal detection mode ======
-        if paused:
-            ann = draw_cn(ann, "[已暂停] 按P继续", (w // 2 - 100, 30), 24,
-                          (0, 255, 255), (0, 0, 0))
-
         if not detection_enabled:
             title_txt = "[纯监控模式] 已关闭模型识别, 按D 恢复识别"
-        elif not model_warmed:
+        elif pose_enabled and pose_model_loading:
+            title_txt = "[姿态模型加载中] 摄像头与远程画面保持正常"
+        elif pose_enabled and pose_load_error and not pose_model_ready:
+            title_txt = "[姿态模型失败] 请再次点击姿态识别重试"
+        elif not active_model_ready():
             title_txt = "[模型加载中] 摄像头画面已正常显示"
         else:
-            title_txt = "[人体识别] M:全屏拍照/人物抓拍"
-        if multi_cam:
-            # 多摄：标题移到顶部居中，避免压住第一路摄像头左上角的信息面板
-            try:
-                _tf = ImageFont.truetype(font_path, 16) if font_path else ImageFont.load_default()
-                _bb = _tf.getbbox(title_txt)
-                _tw = _bb[2] - _bb[0]
-            except Exception:
-                _tw = len(title_txt) * 14
-            ann = draw_cn(ann, title_txt, (max(10, w // 2 - _tw // 2), 10),
-                          16, (0, 255, 0), (30, 30, 30))
-        else:
-            ann = draw_cn(ann, title_txt, (10, 28), 16, (0, 255, 0), (30, 30, 30))
+            title_txt = f"[{current_recognition_name()}] K:切换姿态 M:拍照模式"
 
-        if recording and not show_stream_qr:
-            ann = draw_cn(ann, "● 录制中", (w // 2 - 44, 30), 18, (255, 90, 90), (40, 0, 0))
+        if multi_cam:
+            # 多摄全局状态集中在独立顶部栏，不覆盖第一排摄像头信息。
+            cv2.rectangle(ann, (0, 0), (w - MULTI_CONTROL_W - 1, MULTI_TOP_BAR_H - 1),
+                          (18, 22, 28), -1)
+            cv2.line(ann, (0, MULTI_TOP_BAR_H - 1),
+                     (w - MULTI_CONTROL_W - 1, MULTI_TOP_BAR_H - 1), (64, 70, 80), 1)
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y-%m-%d %H:%M:%S").replace("-0", "-")
+            date_w = text_pixel_width(date_str, 13)
+            title_max_w = max(120, w - MULTI_CONTROL_W - date_w - 48)
+            title_txt = ellipsize_text(title_txt, title_max_w, 16)
+            ann = draw_cn(ann, title_txt, (12, 5), 16, (90, 245, 150))
+            ann = draw_cn(ann, date_str, (w - MULTI_CONTROL_W - 12, 6), 13,
+                          (235, 235, 215), anchor="rt")
+
+            state_parts = ["已暂停" if paused else "运行中"]
+            if pose_enabled:
+                pose_state = "姿态加载中" if pose_model_loading else f"姿态:{pose_people_count}人/{pose_visible_keypoints}点"
+                state_parts.append(pose_state)
+            if recording:
+                state_parts.append("录制中")
+            if auto_snap:
+                state_parts.append(f"自动拍:{'全屏' if snap_mode == 'full' else '人物'}")
+            state_txt = "状态: " + " | ".join(state_parts)
+            overview_txt = f"{len(multi_threads)}路画面 | 总循环 {fps_realtime:.1f} FPS"
+            overview_w = text_pixel_width(overview_txt, 12)
+            state_max_w = max(80, w - MULTI_CONTROL_W - overview_w - 48)
+            state_txt = ellipsize_text(state_txt, state_max_w, 12)
+            ann = draw_cn(ann, state_txt, (12, 30), 12,
+                          (255, 210, 120) if paused else (190, 196, 205))
+            ann = draw_cn(ann, overview_txt, (w - MULTI_CONTROL_W - 12, 30), 12,
+                          (90, 230, 255), anchor="rt")
+        else:
+            if paused:
+                ann = draw_cn(ann, "[已暂停] 按P继续", (w // 2 - 100, 30), 24,
+                              (0, 255, 255), (0, 0, 0))
+            ann = draw_cn(ann, title_txt, (10, 28), 16, (0, 255, 0), (30, 30, 30))
+            if recording and not show_stream_qr:
+                ann = draw_cn(ann, "● 录制中", (w // 2 - 44, 30), 18,
+                              (255, 90, 90), (40, 0, 0))
 
         # ====== Build and draw buttons ======
         btn_mgr.tick_animations(time.time())
@@ -2382,8 +2677,8 @@ while running:
                 "点“刷新列表”可重新扫描插拔后的摄像头",
                 "C/X:备用切换 1:锁定人物 H:帮助",
                 "Space:拍照 R:录制/停止 B:二维码切换(局域网/公网)",
-                "M:切换全屏拍照/人物抓拍",
-                "手机:可拍照/录制/回放(免同一WiFi也能远程看)",
+                "M:切换全屏拍照/人物抓拍 K:姿态识别开关",
+                "手机:可切换姿态/拍照/录制/回放，公网同步显示骨架",
                 "================",
             ]
             overlay_h = len(help_texts) * 26 + 20
@@ -2393,39 +2688,40 @@ while running:
                 ann = draw_cn(ann, txt, (20, 10 + i * 26), 18, (0, 255, 255))
 
         # ====== Date/time display (top-right, won't block buttons) ======
-        now = datetime.datetime.now()
-        date_str = now.strftime("%Y-%m-%d %H:%M:%S").replace("-0", "-")
-        tmp_font = ImageFont.truetype(font_path, 14) if font_path else ImageFont.load_default()
-        if date_str != last_overlay_second:
-            tmp_pil = Image.new("RGB", (1, 1))
-            tmp_d = ImageDraw.Draw(tmp_pil)
-            bbox = tmp_d.textbbox((0, 0), date_str, font=tmp_font)
-            last_overlay_text_w = bbox[2] - bbox[0] + 8
-            last_overlay_second = date_str
-        date_x = w - last_overlay_text_w - 10
-        date_y1 = 8
-        date_y2 = 26
-        # 自动感知背景亮度，选择高对比度文字颜色
-        def _contrast_color(img, x, y, text_w, text_h):
-            """根据背景区域平均亮度返回 (text_color, bg_color)"""
-            x1 = max(0, x)
-            y1 = max(0, y)
-            x2 = min(img.shape[1], x + text_w + 10)
-            y2 = min(img.shape[0], y + text_h + 6)
-            region = img[y1:y2, x1:x2]
-            if region.size == 0:
-                return (255, 255, 200), None
-            avg_brightness = np.mean(region)
-            if avg_brightness > 140:
-                return (20, 20, 20), (220, 220, 220)  # 亮背景 → 深色字 + 浅背景
-            else:
-                return (255, 255, 200), (30, 30, 30)   # 暗背景 → 浅色字 + 深背景
-        date_color, date_bg = _contrast_color(ann, date_x, date_y1 - 2, last_overlay_text_w, 32)
-        ann = draw_cn(ann, date_str, (date_x, date_y1), 14, date_color, date_bg)
-        # 分辨率和实时帧率信息（在日期下方）
-        res_str = f"{cam_w}x{cam_h} @ {fps_realtime:.1f}fps"
-        res_color, res_bg = _contrast_color(ann, date_x, date_y2 - 2, last_overlay_text_w, 20)
-        ann = draw_cn(ann, res_str, (date_x, date_y2), 14, res_color, res_bg)
+        if not multi_cam:
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y-%m-%d %H:%M:%S").replace("-0", "-")
+            tmp_font = ImageFont.truetype(font_path, 14) if font_path else ImageFont.load_default()
+            if date_str != last_overlay_second:
+                tmp_pil = Image.new("RGB", (1, 1))
+                tmp_d = ImageDraw.Draw(tmp_pil)
+                bbox = tmp_d.textbbox((0, 0), date_str, font=tmp_font)
+                last_overlay_text_w = bbox[2] - bbox[0] + 8
+                last_overlay_second = date_str
+            date_x = w - last_overlay_text_w - 10
+            date_y1 = 8
+            date_y2 = 26
+            # 自动感知背景亮度，选择高对比度文字颜色
+            def _contrast_color(img, x, y, text_w, text_h):
+                """根据背景区域平均亮度返回 (text_color, bg_color)"""
+                x1 = max(0, x)
+                y1 = max(0, y)
+                x2 = min(img.shape[1], x + text_w + 10)
+                y2 = min(img.shape[0], y + text_h + 6)
+                region = img[y1:y2, x1:x2]
+                if region.size == 0:
+                    return (255, 255, 200), None
+                avg_brightness = np.mean(region)
+                if avg_brightness > 140:
+                    return (20, 20, 20), (220, 220, 220)  # 亮背景 → 深色字 + 浅背景
+                else:
+                    return (255, 255, 200), (30, 30, 30)   # 暗背景 → 浅色字 + 深背景
+            date_color, date_bg = _contrast_color(ann, date_x, date_y1 - 2, last_overlay_text_w, 32)
+            ann = draw_cn(ann, date_str, (date_x, date_y1), 14, date_color, date_bg)
+            # 分辨率和实时帧率信息（在日期下方）
+            res_str = f"{cam_w}x{cam_h} @ {fps_realtime:.1f}fps"
+            res_color, res_bg = _contrast_color(ann, date_x, date_y2 - 2, last_overlay_text_w, 20)
+            ann = draw_cn(ann, res_str, (date_x, date_y2), 14, res_color, res_bg)
 
     # ====== Auto-snapshot ======
     # 多摄模式已在每个 tile 内分别处理；单摄使用当前原始帧与当前检测结果。
@@ -2437,8 +2733,8 @@ while running:
         ann = cv2.addWeighted(ann, 1.0, np.full_like(ann, 255), 0.4, 0)
         snap_flash -= 1
 
-    # Auto-snap indicator
-    if auto_snap:
+    # Auto-snap indicator is already included in the multicamera top status bar.
+    if auto_snap and not multi_cam:
         mode_txt = f"[自动拍:{'开' if auto_snap else '关'}|{'全屏' if snap_mode=='full' else '人物'}]"
         ann = draw_cn(ann, mode_txt, (10, 50), 15, (0, 200, 255), (0, 0, 0))
 
@@ -2459,36 +2755,60 @@ while running:
 
     # ====== 手机投屏：窗口上叠加二维码与访问地址 ======
     if show_stream_qr and show_desktop:
-        qr_size = 116
-        pad = 10
-        panel_x, panel_y = 12, 78
-        panel_w = qr_size + 2 * pad + 244
-        panel_h = 150
-        ox2 = min(w, panel_x + panel_w)
-        oy2 = min(h, panel_y + panel_h)
-        if oy2 > panel_y and ox2 > panel_x:
-            sub = ann[panel_y:oy2, panel_x:ox2]
-            dark = np.zeros_like(sub)
-            ann[panel_y:oy2, panel_x:ox2] = cv2.addWeighted(sub, 0.30, dark, 0.70, 0)
-        # 二维码
-        if _qr_img is not None:
-            qy2 = panel_y + pad + qr_size
-            qx2 = panel_x + pad + qr_size
-            if qy2 <= h and qx2 <= w:
+        if multi_cam:
+            # 多摄使用右侧控制栏内的紧凑二维码，避免遮住第一路信息栏与 FPS。
+            panel_x = w - MULTI_CONTROL_W
+            panel_y = MULTI_TOP_BAR_H
+            panel_w = MULTI_CONTROL_W
+            panel_h = 154
+            cv2.rectangle(ann, (panel_x, panel_y),
+                          (w - 1, min(h - 1, panel_y + panel_h)), (20, 24, 30), -1)
+            qr_size = 82
+            qr_x = panel_x + (panel_w - qr_size) // 2
+            qr_y = panel_y + 8
+            if _qr_img is not None and qr_y + qr_size <= h:
                 qr_resized = cv2.resize(_qr_img, (qr_size, qr_size),
                                         interpolation=cv2.INTER_NEAREST)
-                ann[panel_y + pad:qy2, panel_x + pad:qx2] = qr_resized
-        # 文本
-        tx = panel_x + pad + qr_size + 12
-        ann = draw_cn(ann, "手机同步观看", (tx, panel_y + pad + 2), 16, (0, 255, 180))
-        ann = draw_cn(ann, f"局域网: {stream_url}", (tx, panel_y + pad + 30), 13, (255, 230, 120))
-        line_pub = f"公网: {remote_url}" if remote_url else "公网: 未连接(按B重试)"
-        ann = draw_cn(ann, line_pub, (tx, panel_y + pad + 54), 13,
-                      (255, 180, 120) if remote_url else (200, 200, 200))
-        target_txt = f"在线: {streamer._clients}  [{'公网' if qr_target == 'public' else '局域网'}二维码]"
-        ann = draw_cn(ann, target_txt, (tx, panel_y + pad + 80), 12, (150, 220, 255))
-        if recording:
-            ann = draw_cn(ann, "● 录制中", (tx, panel_y + pad + 104), 13, (255, 90, 90))
+                ann[qr_y:qr_y + qr_size, qr_x:qr_x + qr_size] = qr_resized
+            target_label = "公网二维码" if qr_target == "public" else "局域网二维码"
+            label_x = panel_x + max(4, (panel_w - text_pixel_width(target_label, 11)) // 2)
+            ann = draw_cn(ann, target_label, (label_x, qr_y + qr_size + 7), 11,
+                          (120, 235, 200))
+            online_txt = f"在线 {streamer._clients}"
+            online_x = panel_x + max(4, (panel_w - text_pixel_width(online_txt, 10)) // 2)
+            ann = draw_cn(ann, online_txt, (online_x, qr_y + qr_size + 29), 10,
+                          (180, 196, 215))
+        else:
+            qr_size = 116
+            pad = 10
+            panel_x, panel_y = 12, 78
+            panel_w = qr_size + 2 * pad + 244
+            panel_h = 150
+            ox2 = min(w, panel_x + panel_w)
+            oy2 = min(h, panel_y + panel_h)
+            if oy2 > panel_y and ox2 > panel_x:
+                sub = ann[panel_y:oy2, panel_x:ox2]
+                dark = np.zeros_like(sub)
+                ann[panel_y:oy2, panel_x:ox2] = cv2.addWeighted(sub, 0.30, dark, 0.70, 0)
+            # 二维码
+            if _qr_img is not None:
+                qy2 = panel_y + pad + qr_size
+                qx2 = panel_x + pad + qr_size
+                if qy2 <= h and qx2 <= w:
+                    qr_resized = cv2.resize(_qr_img, (qr_size, qr_size),
+                                            interpolation=cv2.INTER_NEAREST)
+                    ann[panel_y + pad:qy2, panel_x + pad:qx2] = qr_resized
+            # 文本
+            tx = panel_x + pad + qr_size + 12
+            ann = draw_cn(ann, "手机同步观看", (tx, panel_y + pad + 2), 16, (0, 255, 180))
+            ann = draw_cn(ann, f"局域网: {stream_url}", (tx, panel_y + pad + 30), 13, (255, 230, 120))
+            line_pub = f"公网: {remote_url}" if remote_url else "公网: 未连接(按B重试)"
+            ann = draw_cn(ann, line_pub, (tx, panel_y + pad + 54), 13,
+                          (255, 180, 120) if remote_url else (200, 200, 200))
+            target_txt = f"在线: {streamer._clients}  [{'公网' if qr_target == 'public' else '局域网'}二维码]"
+            ann = draw_cn(ann, target_txt, (tx, panel_y + pad + 80), 12, (150, 220, 255))
+            if recording:
+                ann = draw_cn(ann, "● 录制中", (tx, panel_y + pad + 104), 13, (255, 90, 90))
 
     if show_desktop:
         if not window_created:
@@ -2521,6 +2841,8 @@ while running:
         do_toggle_pause()
     elif key == ord("d"):
         do_toggle_detection()
+    elif key == ord("k"):
+        do_toggle_pose()
     elif key == ord(" "):  # Space - manual snapshot
         do_manual_snap()
     elif key == ord("s"):

@@ -23,3 +23,7 @@ snapshots/
 
 # Model (large file, download separately)
 models/yolov8n.pt
+
+# Pose model downloaded on first use
+models/*pose*.pt
+yolov8n-pose.pt
