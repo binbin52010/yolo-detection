@@ -27,25 +27,50 @@ if (not (_sys.stdout and getattr(_sys.stdout, "isatty", lambda: False)()) and
 
 BASE_DIR = Path(__file__).parent.resolve()
 
-# ====== 模型选择：GPU 用精度更高的 yolov8m，CPU 用轻量 yolov8n ======
-# 想换模型可改这里的候选顺序（如 yolo26n.pt、yolov8s.pt 等）
-if torch.cuda.is_available():
-    _MODEL_CANDIDATES = ["yolov8m.pt", "models/yolov8m.pt",
-                         "yolov8n.pt", "models/yolov8n.pt"]
-else:
-    _MODEL_CANDIDATES = ["yolov8n.pt", "models/yolov8n.pt", "yolo26n.pt"]
+# ====== Person detector selection ======
+# Only accept a detector whose metadata explicitly contains the COCO "person"
+# class. A custom checkpoint with names={0: "item"} previously produced
+# focus_id=-1 and made classes=[-1] suppress every detection.
+_MODEL_CANDIDATES = [
+    "models/yolov8n.pt", "yolov8n.pt",
+    "models/yolov8m.pt", "yolov8m.pt",
+    "models/yolov8n_hard.pt", "yolov8n_hard.pt",
+]
+
+
+def _find_person_class(names):
+    items = names.items() if isinstance(names, dict) else enumerate(names or [])
+    for cid, name in items:
+        if str(name).strip().lower() == "person":
+            return int(cid)
+    return None
+
 
 model_path = None
+model = None
 for _cand in _MODEL_CANDIDATES:
     _p = BASE_DIR / _cand
-    if _p.exists():
+    if not _p.exists():
+        continue
+    try:
+        _candidate_model = YOLO(str(_p))
+        if _find_person_class(_candidate_model.names) is None:
+            print(f"Skipping non-person detector: {_p} names={_candidate_model.names}")
+            continue
         model_path = _p
+        model = _candidate_model
         break
-if model_path is None:
-    model_path = BASE_DIR / "models" / "yolov8n.pt"
+    except Exception as _model_exc:
+        print(f"Skipping broken detector {_p}: {_model_exc}")
 
-print(f"Loading detection model: {model_path}")
-model = YOLO(str(model_path))
+if model is None:
+    model_path = BASE_DIR / "models" / "yolov8n.pt"
+    print(f"No local person detector found, loading: {model_path}")
+    model = YOLO(str(model_path))
+    if _find_person_class(model.names) is None:
+        raise RuntimeError(f"Person class missing from detector: {model.names}")
+
+print(f"Loading detection model: {model_path} (person class ready)")
 POSE_MODEL_PATH = BASE_DIR / "models" / "yolov8n-pose.pt"
 POSE_MODEL_NAME = "yolov8n-pose.pt"
 pose_model = None
@@ -55,6 +80,7 @@ pose_load_error = None
 pose_load_lock = threading.Lock()
 pose_people_count = 0
 pose_visible_keypoints = 0
+detected_people_count = 0
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -251,9 +277,9 @@ def get_color(cid):
 cn_to_en = {cn: en for en, cn in COCO_CN.items()}
 all_names = model.names
 PERSON_CN = "人"
-PERSON_CONF = 0.50   # 降低阈值以提升识别率（更少漏检）
+PERSON_CONF = 0.35   # 降低阈值以提升识别率（更少漏检）
 PERSON_IOU = 0.45
-POSE_KEYPOINT_CONF = 0.25
+POSE_KEYPOINT_CONF = 0.15
 COCO_POSE_SKELETON = (
     (15, 13), (13, 11), (16, 14), (14, 12),
     (11, 12), (5, 11), (6, 12), (5, 6),
@@ -261,18 +287,40 @@ COCO_POSE_SKELETON = (
     (1, 2), (0, 1), (0, 2), (1, 3),
     (2, 4), (3, 5), (4, 6),
 )
-MIN_PERSON_BOX_AREA = 18000
-MIN_PERSON_BOX_HEIGHT = 160
+MIN_PERSON_BOX_AREA = 5000
+MIN_PERSON_BOX_HEIGHT = 80
 
-# ====== Snapshot (拍照) Settings ======
+# ====== Snapshot (鎷嶇収) Settings ======
 SNAP_DIR = BASE_DIR / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
 MAX_STORAGE_GB = 10  # Max storage size in GB (adjustable)
+PLAYBACK_SNAP_LIMIT = int(_os.environ.get("YOLO_PLAYBACK_SNAP_LIMIT", "200"))  # 鎵嬫満鍥炴斁鏈€澶氳繑鍥炵殑鐓х墖鏁?
 snapshot_lock = threading.RLock()
-snapshot_count = sum(1 for _p in SNAP_DIR.iterdir()
-                     if _p.is_file() and _p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+_snapshot_start_meta = []
+for _p in SNAP_DIR.iterdir():
+    if not _p.is_file() or _p.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        continue
+    try:
+        _st = _p.stat()
+        _snapshot_start_meta.append((_st.st_mtime, _st.st_size, _p))
+    except OSError:
+        pass
+snapshot_count = len(_snapshot_start_meta)
+_snapshot_total_bytes = sum(_item[1] for _item in _snapshot_start_meta)
+_snapshot_playback_lock = threading.Lock()
+_snapshot_playback_items = [
+    {"name": _path.name, "type": "image", "url": f"/snap/{_path.name}", "size": _size}
+    for _, _size, _path in sorted(_snapshot_start_meta, key=lambda _item: _item[0], reverse=True)[:PLAYBACK_SNAP_LIMIT]
+]
 
-# ====== 录制（录屏回放） ======
+
+def _remember_snapshot_for_playback(path, size):
+    item = {"name": path.name, "type": "image", "url": f"/snap/{path.name}", "size": int(size)}
+    with _snapshot_playback_lock:
+        _snapshot_playback_items.insert(0, item)
+        del _snapshot_playback_items[PLAYBACK_SNAP_LIMIT:]
+
+# ====== 褰曞埗锛堝綍灞忓洖鏀撅級 ======
 REC_DIR = BASE_DIR / "recordings"
 REC_DIR.mkdir(exist_ok=True)
 recording = False
@@ -316,17 +364,15 @@ def toggle_recording():
         start_recording()
 
 def list_playback_files():
-    """供手机端回放列表使用：返回录像与近期照片。"""
+    """Return recent recordings and cached snapshots without a full directory scan."""
     items = []
     try:
         for f in sorted(REC_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:50]:
             if f.suffix.lower() in (".mp4", ".avi", ".mkv"):
                 items.append({"name": f.name, "type": "video",
                               "url": f"/file/{f.name}", "size": f.stat().st_size})
-        for f in sorted(SNAP_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:30]:
-            if f.suffix.lower() in (".jpg", ".jpeg", ".png"):
-                items.append({"name": f.name, "type": "image",
-                              "url": f"/snap/{f.name}", "size": f.stat().st_size})
+        with _snapshot_playback_lock:
+            items.extend(dict(item) for item in _snapshot_playback_items)
     except Exception:
         pass
     return items
@@ -334,7 +380,7 @@ def list_playback_files():
 pending_main_actions = collections.deque()
 
 
-def phone_command(action):
+def phone_command(action, idx=None):
     """手机端发来的控制指令。"""
     if action == "snapshot":
         do_manual_snap()
@@ -364,31 +410,63 @@ def phone_command(action):
         if recording:
             stop_recording()
         return "recording off"
+    elif action == "stream_profile":
+        profile = str(idx or "balanced").strip().lower()
+        if streamer.set_profile(profile):
+            return f"stream profile {profile}"
+        return "stream profile invalid"
+    elif action == "select_cam":
+        # 閫夋憚鍍忓ご锛氳法绾跨▼瀹夊叏鍏ラ槦锛岀敱涓诲惊鐜湪涓荤嚎绋嬫墽琛屽垏鎹€?
+        try:
+            idx = int(idx) if idx not in (None, "") else -1
+        except Exception:
+            idx = -1
+        if idx < 0 or multi_cam or camera_switching:
+            return "select invalid"
+        with pending_actions_lock:
+            if not any(isinstance(a, tuple) and a[0] == "select_cam" and a[1] == idx
+                       for a in pending_main_actions):
+                pending_main_actions.append(("select_cam", idx))
+        return "select queued"
     return "unknown"
 
 def get_max_storage_bytes():
     return MAX_STORAGE_GB * 1024 * 1024 * 1024
 
 def get_dir_size_mb():
-    """Get total size of snapshot directory in MB."""
-    total = 0
-    if SNAP_DIR.exists():
-        for f in SNAP_DIR.iterdir():
-            if f.is_file():
-                total += f.stat().st_size
-    return total / (1024 * 1024)
+    """Return cached snapshot storage usage without rescanning thousands of files."""
+    return _snapshot_total_bytes / (1024 * 1024)
+
 
 def cleanup_old_snapshots():
-    """Delete oldest files until under max storage limit.
-    FIFO: oldest files are removed first."""
+    """Delete oldest snapshots only when the cached usage approaches the limit."""
+    global _snapshot_total_bytes, snapshot_count
     max_bytes = get_max_storage_bytes()
-    files = sorted(SNAP_DIR.iterdir(), key=lambda f: f.stat().st_mtime)
-    while files and get_dir_size_mb() * 1024 * 1024 > max_bytes * 0.95:
-        oldest = files.pop(0)
+    target_bytes = int(max_bytes * 0.95)
+    if _snapshot_total_bytes <= target_bytes:
+        return
+
+    entries = []
+    for path in SNAP_DIR.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+            entries.append((stat.st_mtime, stat.st_size, path))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[0])
+    # Re-sync once when cleanup is actually needed, then remove oldest first.
+    _snapshot_total_bytes = sum(item[1] for item in entries)
+    for _, size, oldest in entries:
+        if _snapshot_total_bytes <= target_bytes:
+            break
         try:
             oldest.unlink()
-            print(f"  [清理] 已删除最旧照片: {oldest.name} ({get_dir_size_mb():.1f} MB)")
-        except:
+            _snapshot_total_bytes = max(0, _snapshot_total_bytes - size)
+            snapshot_count = max(0, snapshot_count - 1)
+            print(f"  [??] ???????: {oldest.name} ({get_dir_size_mb():.1f} MB)")
+        except OSError:
             pass
 
 def add_watermark(img):
@@ -418,10 +496,8 @@ def add_watermark(img):
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 def _save_snapshot_unlocked(frame, label, conf, full_frame=False):
-    """Save a snapshot with timestamp filename, manage storage.
-    full_frame=True: save entire frame with watermark.
-    full_frame=False: save cropped detection."""
-    global last_snap_path, snapshot_count
+    """Encode and save one snapshot while the caller holds snapshot_lock."""
+    global last_snap_path, snapshot_count, _snapshot_total_bytes
     cleanup_old_snapshots()
 
     now = datetime.datetime.now()
@@ -457,10 +533,12 @@ def _save_snapshot_unlocked(frame, label, conf, full_frame=False):
                                    [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok_enc:
             raise RuntimeError("imencode failed")
+        jpeg_bytes = buf.tobytes()
         with open(str(fpath), "wb") as _f:
-            _f.write(buf.tobytes())
-        size_mb = get_dir_size_mb()
-        print(f"  [拍照] {fname}  ({size_mb:.1f} MB / {MAX_STORAGE_GB} GB)")
+            _f.write(jpeg_bytes)
+        _snapshot_total_bytes += len(jpeg_bytes)
+        _remember_snapshot_for_playback(fpath, len(jpeg_bytes))
+        print(f"  [拍照] {fname}  ({get_dir_size_mb():.1f} MB / {MAX_STORAGE_GB} GB)")
         last_snap_path = str(fpath)
         snapshot_count += 1
         return True
@@ -567,7 +645,7 @@ def active_model_ready():
 
 
 def current_recognition_name():
-    return "人体姿态" if pose_enabled else "人体识别"
+    return "\u4eba\u4f53\u59ff\u6001" if pose_enabled else "\u4eba\u4f53\u8bc6\u522b"
 
 
 def load_pose_model():
@@ -616,9 +694,75 @@ def reset_auto_snap_state(camera_key=None):
     last_snap_time = 0.0
 
 
+def _seen_match_key(state, track_id, cx, cy, w, h,
+                    tol_ratio=0.6, size_ratio=4.0):
+    """Match a current person box to recent tracking history."""
+    seen = state.get('seen', {})
+    # 1) 绮剧‘ track_id 浼樺厛锛屼絾蹇呴』鍑犱綍涓€鑷达紙浣嶇疆杩?+ 灏哄鐩歌繎锛?
+    if track_id >= 0 and track_id in seen:
+        info = seen[track_id]
+        if w > 0 and h > 0:
+            dcx = abs(cx - info.get('cx', cx)) / w
+            dcy = abs(cy - info.get('cy', cy)) / h
+            d = (dcx * dcx + dcy * dcy) ** 0.5
+            iw, ih = info.get('w', 0), info.get('h', 0)
+            if d <= tol_ratio and iw > 0 and ih > 0:
+                sr = (w * h) / float(iw * ih)
+                sr = max(sr, 1.0 / sr)
+                if sr <= size_ratio:
+                    return track_id
+    # 2) 鍑犱綍鍖归厤锛氭壘涓績鏈€杩戜笖灏哄鐩歌繎鑰?
+    best_k = None
+    best_d = 1e9
+    for k, info in seen.items():
+        if w <= 0 or h <= 0:
+            continue
+        dcx = abs(cx - info.get('cx', cx)) / w
+        dcy = abs(cy - info.get('cy', cy)) / h
+        d = (dcx * dcx + dcy * dcy) ** 0.5
+        if d > tol_ratio:
+            continue
+        iw, ih = info.get('w', 0), info.get('h', 0)
+        if iw <= 0 or ih <= 0:
+            continue
+        sr = (w * h) / float(iw * ih)
+        sr = max(sr, 1.0 / sr)
+        if sr > size_ratio:
+            continue
+        if d < best_d:
+            best_d = d
+            best_k = k
+    return best_k
+
+
+def _compute_is_new(state, track_id, cx, cy, w, h, now_time, absence_reset):
+    """Internal helper."""
+    key = _seen_match_key(state, track_id, cx, cy, w, h)
+    if key is None:
+        return True
+    rec = state['seen'].get(key)
+    if rec is None:
+        return True
+    return (now_time - rec.get('t', 0.0)) > absence_reset
+
+
+def _motion_of(rec, cx, cy, bw, bh, fw, fh):
+    """Internal helper."""
+    if not rec:
+        return 0.0, 0.0
+    pcx, pcy = rec.get('cx', cx), rec.get('cy', cy)
+    pw, ph = rec.get('w', bw), rec.get('h', bh)
+    move = (((cx - pcx) / max(fw, 1)) ** 2 +
+            ((cy - pcy) / max(fh, 1)) ** 2) ** 0.5
+    pa = pw * ph
+    ca = bw * bh
+    size_change = abs(ca - pa) / max(pa, 1) if pa > 0 else 0.0
+    return move, size_change
+
+
 def maybe_auto_snapshot(source_frame, boxes, camera_key, source_label=None):
     """Capture the best person, with movement and periodic fallback triggers."""
-    global last_snap_target, last_snap_time, snap_flash
+    global last_snap_target, last_snap_time, snap_flash, _global_last_snap
     if (not detection_enabled or not auto_snap or paused or sel or not focus or
             focus_id < 0 or source_frame is None):
         return False
@@ -629,12 +773,21 @@ def maybe_auto_snapshot(source_frame, boxes, camera_key, source_label=None):
         'last_target': None,
         'missing_since': None,
         'absence_reset': False,
+        'seen': {},
+        'last_any_seen': -1e9,
+        'last_any_snap': -1e9,
     })
+    # 鏈抚寮€濮嬫椂鐨勨€滄渶杩戜竴娆＄敾闈㈡湁浜衡€濇椂闂达紝鐢ㄤ簬鍒ゅ畾鈥滅敾闈㈡槸鍚﹀垰浠庢棤浜哄彉鏈変汉鈥?
+    prev_any_seen = state.get('last_any_seen', -1e9)
     frame_h, frame_w = source_frame.shape[:2]
     xyxy_list, conf_list, cls_list, track_id_list = get_boxes_data(boxes)
 
-    best = None
-    best_score = -1.0
+    # 瑙ｆ瀽鍊欓€夛細鏈抚寮€濮嬫椂鐨?seen 浠呰鍙栵紝缁熶竴鍦ㄥ啓鍥為樁娈垫洿鏂帮紝閬垮厤鍚屽抚浜掔浉姹℃煋銆?
+    # 姣忎釜鍊欓€夊瓨 (cid, conf, x1,y1,x2,y2, track_id, mkey, rec)
+    #   mkey 鈥斺€?鍐欏洖鍓嶅尮閰嶅埌鐨勫凡鐭ョ洰鏍?key锛圢one=灞忓箷涓婃湭鍖归厤鍒板凡鐭ョ洰鏍囷級
+    #   rec  鈥斺€?鍐欏洖鍓嶈宸茬煡鐩爣鐨?seen 璁板綍锛堢敤浜庣畻甯ч棿杩愬姩/涓婃鎷嶇収鏃堕棿锛?
+    candidates = []
+    seen_updates = []  # (mkey, cx, cy, bw, bh, rec)
     for i in range(len(xyxy_list)):
         cid = int(cls_list[i])
         if cid != focus_id:
@@ -648,18 +801,19 @@ def maybe_auto_snapshot(source_frame, boxes, camera_key, source_label=None):
         if conf < PERSON_CONF:
             continue
         track_id = int(track_id_list[i]) if i < len(track_id_list) else -1
-        area_score = ((x2 - x1) * (y2 - y1)) / max(frame_w * frame_h, 1)
-        score = conf + (0.15 if track_id >= 0 else 0.0) + area_score
-        if score > best_score:
-            best_score = score
-            best = (cid, conf, x1, y1, x2, y2)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        bw, bh = x2 - x1, y2 - y1
+        # 鍐欏洖鍓嶅尮閰嶏紙姝ゆ椂 seen 灏氭湭琚湰甯у啓鍥烇紝鍖归厤缁撴灉鍙潬锛?
+        mkey = _seen_match_key(state, track_id, cx, cy, bw, bh)
+        rec = state['seen'].get(mkey) if mkey is not None else None
+        candidates.append((cid, conf, x1, y1, x2, y2, track_id, mkey, rec))
+        seen_updates.append((mkey, cx, cy, bw, bh, rec))
 
-    if best is None:
+    if not candidates:
         if state['missing_since'] is None:
             state['missing_since'] = now_time
         elif (not state['absence_reset'] and
               now_time - state['missing_since'] >= snap_absence_reset):
-            # A person leaving and returning is a new event, even if the previous
             # photo was less than the normal stationary-person interval ago.
             state['last_target'] = None
             state['absence_reset'] = True
@@ -667,29 +821,82 @@ def maybe_auto_snapshot(source_frame, boxes, camera_key, source_label=None):
 
     state['missing_since'] = None
     state['absence_reset'] = False
-    cid, conf, x1, y1, x2, y2 = best
-    curr_target = ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
-    elapsed = now_time - state['last_time']
-    should_snap = (state['last_target'] is None and
-                   (state['last_time'] <= 0.0 or elapsed >= snap_cooldown))
+    state['last_any_seen'] = now_time  # 鏈抚鏈夌洰鏍囷紝鏇存柊鈥滅敾闈㈡湁浜衡€濇椂闂?
 
-    if not should_snap and elapsed >= snap_max_interval:
-        # Stationary people still need periodic evidence; the previous logic
-        # could suppress all photos forever after the first one.
-        should_snap = True
-    elif not should_snap and elapsed >= snap_cooldown:
-        prev_cx, prev_cy, prev_w, prev_h = state['last_target']
-        curr_cx, curr_cy, curr_w, curr_h = curr_target
-        move_dist = (((curr_cx - prev_cx) / max(frame_w, 1)) ** 2 +
-                     ((curr_cy - prev_cy) / max(frame_h, 1)) ** 2) ** 0.5
-        prev_area = prev_w * prev_h
-        curr_area = curr_w * curr_h
-        size_change = abs(curr_area - prev_area) / max(prev_area, 1)
-        should_snap = (move_dist > snap_move_threshold or
-                       size_change > snap_size_threshold)
+    # 闄愬埗 seen 瀛楀吀瑙勬ā锛岄伩鍏嶉暱浼氳瘽鏃犻檺澧為暱
+    if len(state['seen']) > 200:
+        cutoff = now_time - 600
+        state['seen'] = {k: v for k, v in state['seen'].items()
+                         if v.get('t', 0.0) >= cutoff}
 
-    if not should_snap:
+    # 鏈抚鎵€鏈夊湪鍦虹洰鏍囧啓鍥炩€滃湪鍦烘椂闂?浣嶇疆鈥濓紙淇濈暀鍏朵笂娆℃媿鐓ф椂闂?last_snap锛?
+    for mkey, cx, cy, bw, bh, rec in seen_updates:
+        if mkey is None:
+            mkey = ("g", int(cx // 40), int(cy // 40), int(max(bw, 1) // 40))
+        prev_snap = rec.get('last_snap', -1e9) if rec else -1e9
+        state['seen'][mkey] = {'t': now_time, 'cx': cx, 'cy': cy,
+                               'w': bw, 'h': bh, 'last_snap': prev_snap}
+
+    # 鐢婚潰鍒氫粠鏃犱汉鍙樻湁浜?= 姝や汉鈥滅獊鐒跺嚭鐜扳€?
+    really_new = (now_time - prev_any_seen) > snap_absence_reset
+    last_any_snap = state.get('last_any_snap', -1e9)
+
+    # 鍦ㄢ€滃簲璇ユ媿鈥濈殑鍊欓€夐噷锛岄€夌疆淇″害+闈㈢Н鏈€楂樿€咃紙閬垮厤鍗曞抚澶氱洰鏍囪繛鎷嶅埛灞忥級
+    best = None
+    best_score = -1.0
+    best_reason = ''
+    for c in candidates:
+        (cid, conf, x1, y1, x2, y2, track_id, mkey, rec) = c
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        bw, bh = x2 - x1, y2 - y1
+        if mkey is not None and rec is not None:
+            # 宸茬煡鐩爣锛氱敤鍏惰嚜韬笂娆℃媿鐓ф椂闂翠笌甯ч棿杩愬姩
+            since_snap = now_time - rec.get('last_snap', -1e9)
+            move, size_change = _motion_of(rec, cx, cy, bw, bh, frame_w, frame_h)
+            action_large = (move > snap_action_move or
+                            size_change > snap_action_size)
+        else:
+            # 鍖归厤涓嶅埌锛氱敾闈㈣繎鏈熶竴鐩存湁浜?-> 瑙嗕负鍚屼汉绉诲姩/鏂版潵鑰咃紝鎸夆€滃姩浣滃ぇ鈥濆鐞嗭紱
+            # 鐢ㄦ憚鍍忓ご绾ф渶灏忛棿闅旂害鏉燂紝閬垮厤鎸佺画璧板姩鑰呰姣忓抚鍒や负鏂颁汉鑰岄珮棰戞姄鎷?
+            since_snap = now_time - last_any_snap
+            action_large = True
+        periodic_due = since_snap >= snap_periodic_interval
+        should = False
+        reason = ''
+        if really_new and mkey is None:
+            # 1) 绐佺劧鍑虹幇 -> 绔嬪埢鎷嶏紙浠呭彈鍏ㄥ眬鏂颁汉鍐峰嵈绾︽潫锛?
+            if now_time - _global_last_snap >= snap_new_cooldown:
+                should = True
+                reason = 'new'
+        else:
+            # 2) 鍔ㄤ綔澶?鍑嗗绂诲紑 -> 鎷嶏紙鍙楁渶灏忛棿闅旂害鏉燂紝闃茶繛缁埛灞忥級
+            if action_large and since_snap >= snap_min_gap:
+                should = True
+                reason = 'action'
+            # 3) 绋冲畾鍦ㄥ満 -> 姣忛殧鍛ㄦ湡鎷嶄竴寮犵暀瀛?
+            elif periodic_due and since_snap >= snap_min_gap:
+                should = True
+                reason = 'periodic'
+        if should:
+            area = ((x2 - x1) * (y2 - y1)) / max(frame_w * frame_h, 1)
+            score = conf + area
+            if score > best_score:
+                best_score = score
+                best = c
+                best_reason = reason
+
+    if best is None:
         return False
+
+    (cid, conf, x1, y1, x2, y2, track_id, mkey, rec) = best
+    # 鏇存柊鎷嶇収鏃堕棿锛氭憚鍍忓ご绾?+ 宸茬煡鐩爣鑷韩鐨?key
+    state['last_any_snap'] = now_time
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    bw, bh = x2 - x1, y2 - y1
+    eff_key = mkey if mkey is not None else \
+        ("g", int(cx // 40), int(cy // 40), int(max(bw, 1) // 40))
+    if eff_key in state['seen']:
+        state['seen'][eff_key]['last_snap'] = now_time
 
     margin = int((x2 - x1) * 0.15)
     crop = source_frame[max(0, y1 - margin):min(frame_h, y2 + margin),
@@ -704,11 +911,17 @@ def maybe_auto_snapshot(source_frame, boxes, camera_key, source_label=None):
         return False
 
     state['last_time'] = now_time
+    curr_target = ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
     state['last_target'] = curr_target
     last_snap_time = now_time
     last_snap_target = curr_target
+    _global_last_snap = now_time
     snap_flash = 12
-    print(f"  [自动拍] {source_label or '当前摄像头'} 已保存")
+    # 鎶婅繖娆℃姄鎷嶈褰曡繘浣嶇疆璁板繂锛堣瑙夊寲鈥滆皝鈥濓級
+    idx = _pos_index((x1 + x2) / 2, (y1 + y2) / 2, frame_w, frame_h)
+    _pos_set_snap(camera_key, idx, last_snap_path)
+    reason_cn = {'new': 'new', 'action': 'action', 'periodic': 'periodic'}.get(best_reason, best_reason)
+    print(f"  [auto snapshot] {source_label or chr(99)+chr(97)+chr(109)} saved ({reason_cn}, person #{track_id})")
     return True
 
 
@@ -825,7 +1038,12 @@ def try_open_camera(idx, verify=False):
     for backend in get_cap_backends():
         cap = cv2.VideoCapture(idx, backend)
         if cap.isOpened():
-            if not verify or _read_valid_camera_frame(cap) is not None:
+            # Virtual cameras and USB capture cards can need close to a second
+            # before their first stable frames. A short probe made available
+            # cameras randomly disappear from the remote selector after restart.
+            probe = None if not verify else _read_valid_camera_frame(
+                cap, min_valid=2, max_attempts=30, delay=0.04)
+            if not verify or probe is not None:
                 return cap, backend
         cap.release()
     return cv2.VideoCapture(), None
@@ -837,7 +1055,7 @@ def get_camera_devices(active_index=None):
     if active_index is not None:
         devices.append({
             'index': int(active_index),
-            'label': f"摄像头{active_index} (当前)",
+            'label': f'\u6444\u50cf\u5934{active_index} (\u5f53\u524d)',
         })
     scan_max = max(1, int(_os.environ.get("YOLO_CAMERA_SCAN_MAX", "6")))
     for i in range(scan_max):
@@ -848,7 +1066,7 @@ def get_camera_devices(active_index=None):
             backend_name = test_cap.getBackendName() if backend is not None else "default"
             devices.append({
                 'index': i,
-                'label': f"摄像头{i} ({backend_name})",
+                'label': f'\u6444\u50cf\u5934{i} ({backend_name})',
             })
         test_cap.release()
     devices.sort(key=lambda item: item['index'])
@@ -856,18 +1074,17 @@ def get_camera_devices(active_index=None):
 
 def get_cam_names(active_index=None):
     devices = get_camera_devices(active_index=active_index)
-    return [device['label'] for device in devices] if devices else [f"摄像头{i}" for i in range(3)]
+    return [device['label'] for device in devices] if devices else [f'\u6444\u50cf\u5934{i}' for i in range(3)]
 
 
 def open_cam(idx):
     cap, backend = try_open_camera(idx)
     target_w, target_h = 1280, 720
-    current_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else 0
-    current_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else 0
-    # DirectShow rebuilds its graph on FOURCC/height/FPS changes (several seconds
-    # per camera). Keep an already-HD native mode; only negotiate when resolution
-    # is genuinely below the requested monitoring quality.
-    if cap.isOpened() and (current_w < target_w or current_h < target_h):
+    # Capture directly in the same 16:9 size used by inference/streaming.  Many
+    # USB cameras default to uncompressed 1920x1080 YUY2, which is often limited
+    # to about 15 FPS. MJPG 1280x720 substantially reduces USB bandwidth and
+    # latency while preserving the full, uncropped camera field of view.
+    if cap.isOpened():
         try:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
@@ -935,7 +1152,7 @@ def switch_cam(d, cam_names=None):
 
 # ====== Mouse Clickable Buttons ======
 class Button:
-    """屏幕上的可点击按钮，带平滑悬停高亮与点击脉冲反馈。"""
+    """Internal helper."""
     def __init__(self, x, y, w, h, label, callback, color=(60, 60, 60),
                  text_color=(255, 255, 255), font_size=14):
         self.x = x
@@ -986,7 +1203,7 @@ class Button:
 
 
 class ButtonManager:
-    """管理所有可点击按钮，并维护点击脉冲动画状态。"""
+    """Internal helper."""
     def __init__(self):
         self.buttons = []
         self.flash = {}     # label -> 点击时刻(time.time())，用于脉冲动画
@@ -1013,7 +1230,7 @@ class ButtonManager:
         """每帧推进悬停平滑插值，并清理过期的点击脉冲。"""
         for btn in self.buttons:
             target = 1.0 if btn.hover else 0.0
-            btn.hover_amt += (target - btn.hover_amt) * 0.28  # 指数平滑
+            btn.hover_amt += (target - btn.hover_amt) * 0.28  # 鎸囨暟骞虫粦
             if btn.hover_amt < 0.01:
                 btn.hover_amt = 0.0
         expired = [k for k, t0 in self.flash.items() if now - t0 > 0.4]
@@ -1047,7 +1264,7 @@ def start_cam_transition():
     cam_transition = {'active': True, 't0': time.time(), 'dur': 0.4, 'old': old}
 
 
-# ====== Multi-Camera (多摄平铺) ======
+# ====== Multi-Camera (澶氭憚骞抽摵) ======
 def calc_grid(n):
     """根据摄像头数量计算最优行列布局 (rows, cols)。"""
     if n <= 1:
@@ -1085,7 +1302,7 @@ def fit_complete_on_blur(frame, target_w, target_h):
 
 
 class CamCaptureThread(threading.Thread):
-    """每路摄像头独立采集；停止时绝不在 ``read`` 中途释放句柄。"""
+    """Internal helper."""
     def __init__(self, cap, idx, label):
         super().__init__(name=f"camera-{idx}", daemon=True)
         self.cap = cap
@@ -1174,7 +1391,7 @@ def open_all_cameras(reuse_capture=None, reuse_index=None):
         if _read_valid_camera_frame(camera_cap, min_valid=2, max_attempts=6,
                                     delay=0.015) is None:
             camera_cap.release()
-            print(f"多摄: 摄像头 {idx} 无有效画面，已跳过")
+            print(f"Multi camera: camera {idx} has no valid frames; skipped")
             continue
         opened.append(CamCaptureThread(camera_cap, idx, dev['label']))
 
@@ -1183,19 +1400,19 @@ def open_all_cameras(reuse_capture=None, reuse_index=None):
         for th in opened:
             th.request_stop()
             th.release_after_join()
-        print(f"多摄: 只成功打开 {total} 路，需要至少 2 路")
+        print(f"Multi camera: only {total} valid camera(s); need at least 2")
         return False
 
     if reuse_capture is not None and reuse_capture.isOpened():
         label = next((d['label'] for d in cam_devices if d['index'] == reuse_index),
-                     f"摄像头{reuse_index}")
+                     f'\u6444\u50cf\u5934{reuse_index}')
         opened.insert(0, CamCaptureThread(reuse_capture, reuse_index, label))
 
     multi_threads = opened
     multi_cached_results = [empty_inference_cache() for _ in opened]
     for th in multi_threads:
         th.start()
-    print(f"多摄模式: 已打开 {len(multi_threads)} 个摄像头（独立采集线程）")
+    print(f"Multi camera opened: {len(multi_threads)} capture threads")
     return True
 
 
@@ -1241,6 +1458,26 @@ def read_all_frames():
     return frames
 
 
+_no_signal_frame_cache = None
+
+
+def make_no_signal_frame(w=None, h=None):
+    """Create a cached no-signal placeholder frame."""
+    global _no_signal_frame_cache
+    w = OUTPUT_W if w is None else int(w)
+    h = OUTPUT_H if h is None else int(h)
+    if (_no_signal_frame_cache is not None and
+            _no_signal_frame_cache.shape[:2] == (h, w)):
+        return _no_signal_frame_cache.copy()
+    img = np.full((h, w, 3), (18, 20, 26), dtype=np.uint8)
+    cv2.putText(img, "CAMERA OFFLINE", (max(20, w // 2 - 190), h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 230, 240), 2, cv2.LINE_AA)
+    cv2.putText(img, "RECONNECTING...", (max(20, w // 2 - 145), h // 2 + 48),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (100, 190, 240), 2, cv2.LINE_AA)
+    _no_signal_frame_cache = img
+    return img.copy()
+
+
 def do_toggle_multi_cam():
     """稳定切换多摄/单摄；过滤连点并串行化所有摄像头资源变更。"""
     global multi_cam, _buttons_built_for_size, cap, cur, cam_w, cam_h, cam_fps
@@ -1248,13 +1485,13 @@ def do_toggle_multi_cam():
 
     now = time.monotonic()
     if now - last_multi_toggle_at < MULTI_TOGGLE_DEBOUNCE:
-        print("多摄: 操作过快，已忽略重复点击")
+        print("Multi camera toggle ignored: debounce")
         return False
     if camera_scan_running:
-        print("多摄: 正在扫描摄像头，请稍候再试")
+        print("Multi camera unavailable while camera scan is running")
         return False
     if not camera_transition_lock.acquire(blocking=False):
-        print("多摄: 上一次切换尚未完成")
+        print("Multi camera switch already in progress")
         return False
 
     camera_switching = True
@@ -1262,28 +1499,28 @@ def do_toggle_multi_cam():
     try:
         if not multi_cam:
             if len(cam_devices) < 2:
-                print("多摄: 可用摄像头不足 2 个，请先刷新列表")
+                print("Multi camera requires at least two cameras")
                 return False
             start_cam_transition()
             if not open_all_cameras(reuse_capture=cap, reuse_index=cur):
-                print("多摄: 打开失败，保持单摄")
+                print("Multi camera open failed")
                 return False
             multi_cam = True
             multi_frame_counter = 0
             reset_auto_snap_state()
-            print(f"多摄模式: {len(multi_threads)} 个摄像头平铺")
+            print(f"Multi camera mode: {len(multi_threads)} cameras")
         else:
             start_cam_transition()
             kept_cap = close_all_cameras(keep_index=cur)
             if kept_cap is False:
-                print("多摄: 线程尚未安全退出，保持多摄模式")
+                print("Multi camera threads did not stop safely")
                 return False
             if kept_cap is None or not kept_cap.isOpened():
-                print("多摄: 句柄交接失败，尝试重新打开单摄")
+                print("Camera handle transfer failed; reopening single camera")
                 kept_cap, cam_w, cam_h, cam_fps = open_cam(cur)
                 if not kept_cap.isOpened():
                     kept_cap.release()
-                    print("多摄: 单摄恢复失败，正在重新打开多摄")
+                    print("Single camera recovery failed; reopening multi camera")
                     if open_all_cameras():
                         multi_cam = True
                     return False
@@ -1293,10 +1530,10 @@ def do_toggle_multi_cam():
             cam_fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
             multi_cam = False
             reset_auto_snap_state()
-            print("已切回单摄模式")
+            print("Returned to single camera mode")
         return True
     except Exception as exc:
-        print(f"多摄切换失败: {exc}")
+        print(f"Multi camera switch failed: {exc}")
         if not multi_cam and (cap is None or not cap.isOpened()):
             cap, cam_w, cam_h, cam_fps = open_cam(cur)
         return False
@@ -1307,27 +1544,100 @@ def do_toggle_multi_cam():
         camera_transition_lock.release()
 
 
-# ====== 性能优化配置 ======
+# ====== 鎬ц兘浼樺寲閰嶇疆 ======
 # 推理输入尺寸：GPU 算力足用较大尺寸提升小目标识别率；CPU 适当降低保速度
 INFER_SIZE = 640
 # 跳帧推理：GPU 逐帧推理(=1)以保证实时性与识别率；CPU 每 2 帧推理一次
 INFER_EVERY_N = 1 if device == "cuda" else 2
+POSE_INFER_EVERY_N = 2 if device == "cuda" else 3
 # 多摄每路推理尺寸（每帧要跑多路，故偏小保证整体流畅）
 MULTI_INFER_SIZE = 416 if device == "cuda" else 320
-POSE_INFER_SIZE = 640 if device == "cuda" else 416
-MULTI_POSE_INFER_SIZE = 384 if device == "cuda" else 320
+POSE_INFER_SIZE = 448 if device == "cuda" else 384
+MULTI_POSE_INFER_SIZE = 352 if device == "cuda" else 288
 # 使用半精度推理（需 GPU 支持）
 USE_HALF = device == "cuda"
 OUTPUT_W, OUTPUT_H = 1280, 720
+# 妗岄潰绐楀彛灏哄绾︽潫锛氶攣瀹?16:9 鐢婚潰姣斾緥锛屽苟闄愬埗鏈€灏忓昂瀵革紝
+# 閬垮厤鐢ㄦ埛鎷栨嫿绐楀彛鏃剁敾闈?鎸夐挳琚媺浼稿彉褰紝鎴栫缉寰楀お灏忕湅涓嶆竻銆?
+DISPLAY_ASPECT = OUTPUT_W / OUTPUT_H   # 16:9
+MIN_WIN_W = 640                        # 鏈€灏忕獥鍙ｅ锛堜笉灏忎簬姝ゅ€兼墠鐪嬪緱娓呯敾闈級
+MIN_WIN_H = 360                        # 涓?MIN_WIN_W 鍚屾瘮渚?16:9
+WIN_RESIZE_TOL = 2                     # 鏍℃瀹瑰樊(px)锛岄伩鍏嶆瘡甯ф姈鍔?姝诲惊鐜?
 MULTI_TOP_BAR_H = 54
 MULTI_CONTROL_W = 112
 MULTI_TILE_INFO_H = 46
 PHONE_STACK_W = 960      # 手机端多摄竖排时每路画面的宽度（竖排避免平铺过小）
 PHONE_INFO_PANEL = _os.environ.get("YOLO_PHONE_PANEL", "0").lower() in {"1", "true", "yes", "on"}
-STREAM_FPS = int(_os.environ.get("YOLO_STREAM_FPS", "30"))
-STREAM_QUALITY = int(_os.environ.get("YOLO_STREAM_QUALITY", "68"))
-STREAM_MAX_WIDTH = int(_os.environ.get("YOLO_STREAM_WIDTH", "960"))
+STREAM_FPS = int(_os.environ.get("YOLO_STREAM_FPS", "20"))
+STREAM_QUALITY = int(_os.environ.get("YOLO_STREAM_QUALITY", "76"))
+STREAM_MAX_WIDTH = int(_os.environ.get("YOLO_STREAM_WIDTH", "1024"))
 
+
+
+class LatestPoseWorker:
+    """Internal helper."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._frame = None
+        self._result = empty_inference_cache()
+        self._running = True
+        self.inference_ms = 0.0
+        self.completed = 0
+        self._thread = threading.Thread(target=self._loop, name="pose-inference", daemon=True)
+        self._thread.start()
+
+    def submit(self, frame):
+        if frame is None:
+            return
+        with self._lock:
+            self._frame = frame.copy()
+        self._event.set()
+
+    def latest(self):
+        with self._lock:
+            return self._result
+
+    def reset(self):
+        with self._lock:
+            self._frame = None
+            self._result = empty_inference_cache()
+        self.inference_ms = 0.0
+        self.completed = 0
+
+    def _loop(self):
+        while self._running:
+            self._event.wait(0.5)
+            self._event.clear()
+            if not self._running:
+                break
+            with self._lock:
+                frame = self._frame
+                self._frame = None
+            if frame is None or not pose_enabled or not pose_model_ready or pose_model is None:
+                continue
+            t0 = time.perf_counter()
+            try:
+                results = pose_model.predict(
+                    frame, imgsz=POSE_INFER_SIZE, verbose=False, half=USE_HALF,
+                    classes=[0], conf=PERSON_CONF, iou=PERSON_IOU,
+                )
+                cache = result_to_cache(results[0])
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                with self._lock:
+                    self._result = cache
+                self.inference_ms = elapsed
+                self.completed += 1
+            except Exception as exc:
+                if self.completed % 60 == 0:
+                    print(f"Async pose inference failed: {exc}")
+
+    def stop(self):
+        self._running = False
+        self._event.set()
+
+
+pose_async = LatestPoseWorker()
 
 
 _phone_snap_cache = (None, None)  # (path, thumb) 抓拍缩略图缓存
@@ -1359,60 +1669,31 @@ def get_snap_thumb():
 
 def make_phone_portrait(cam, person_count=0, fps=0.0, locked_id=None,
                         locked_conf=0.0, snap_thumb=None, online=0):
-    """把单摄横屏画面合成为竖屏自适应画面。
-
-    中间放摄像头画面，上下留白区改成信息面板（时间/人数/帧率/锁定状态/
-    在线设备/最近抓拍缩略图），这样手机竖屏观看时原本的黑边被利用起来，
-    画面更饱满、信息更直观。
-    """
+    """Build a complete, uncropped portrait monitor frame."""
     W, H = 720, 1280
     ch, cw = cam.shape[:2]
     cam_h = max(1, int(round(W * ch / max(cw, 1))))
     cam_r = cv2.resize(cam, (W, cam_h), interpolation=cv2.INTER_LINEAR)
-    H_top = (H - cam_h) // 2
-    H_bot = H - H_top - cam_h
-    # Fill the portrait screen with a blurred live background instead of black bars,
-    # while keeping the complete uncropped camera image sharp in the center.
+    top = max(0, (H - cam_h) // 2)
     tiny = cv2.resize(cam, (60, 106), interpolation=cv2.INTER_AREA)
     tiny = cv2.GaussianBlur(tiny, (0, 0), 3.5)
     canvas = cv2.resize(tiny, (W, H), interpolation=cv2.INTER_LINEAR)
     canvas = cv2.addWeighted(canvas, 0.34, np.zeros_like(canvas), 0.66, 0)
-    canvas[H_top:H_top + cam_h, 0:W] = cam_r
-    # 上下分隔亮条（青绿）
-    cv2.rectangle(canvas, (0, H_top - 4), (W, H_top), (120, 180, 0), -1)
-    cv2.rectangle(canvas, (0, H_top + cam_h), (W, H_top + cam_h + 4), (120, 180, 0), -1)
-
-    # ---- 顶部信息面板 ----
+    end = min(H, top + cam_h)
+    canvas[top:end, :W] = cam_r[:end-top]
     now = datetime.datetime.now()
-    canvas = draw_cn(canvas, "实时监控", (24, 28), 34, (0, 230, 150))
-    canvas = draw_cn(canvas, "人体识别 · 手机远程", (24, 78), 18, (150, 160, 170))
-    canvas = draw_cn(canvas, now.strftime("%Y-%m-%d"), (W - 24, 26), 20, (200, 200, 205), anchor="rt")
-    canvas = draw_cn(canvas, now.strftime("%H:%M:%S"), (W - 24, 56), 30, (255, 255, 255), anchor="rt")
-
-    # ---- 底部信息面板 ----
-    by = H_top + cam_h + 16
-    # 左：最近抓拍缩略图
-    canvas = draw_cn(canvas, "最近抓拍", (24, by + 4), 18, (150, 200, 255))
-    if snap_thumb is not None:
-        canvas[by + 28:by + 28 + 94, 24:24 + 140] = snap_thumb
-        cv2.rectangle(canvas, (24, by + 28), (24 + 140, by + 28 + 94), (90, 110, 130), 1)
-    else:
-        canvas = draw_cn(canvas, "暂无抓拍", (24, by + 60), 18, (110, 120, 130))
-    # 中：检测人数 + 监控状态
-    canvas = draw_cn(canvas, "当前检测人数", (190, by + 6), 18, (170, 180, 190))
-    cnt_color = (0, 230, 150) if person_count > 0 else (120, 130, 140)
-    canvas = draw_cn(canvas, f"{person_count}", (190, by + 30), 54, cnt_color)
-    dot = (0, 220, 120) if person_count > 0 else (100, 110, 120)
-    cv2.circle(canvas, (196, by + 108), 8, dot, -1)
-    canvas = draw_cn(canvas, "监控中", (210, by + 100), 18, (180, 190, 200))
-    # 右：在线设备 + 帧率 + 锁定状态
-    canvas = draw_cn(canvas, f"在线设备 {online}", (W - 24, by + 6), 20, (120, 200, 255), anchor="rt")
-    canvas = draw_cn(canvas, f"帧率 {fps:.1f} FPS", (W - 24, by + 44), 20, (255, 230, 120), anchor="rt")
+    cv2.putText(canvas, "NEURAL WATCH", (24, 42), cv2.FONT_HERSHEY_SIMPLEX,
+                0.82, (80, 245, 190), 2, cv2.LINE_AA)
+    cv2.putText(canvas, now.strftime("%Y-%m-%d %H:%M:%S"), (350, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 235, 240), 1, cv2.LINE_AA)
+    info_y = min(H - 90, end + 40)
+    cv2.putText(canvas, f"PEOPLE {person_count}   {fps:.1f} FPS   ONLINE {online}",
+                (24, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (110, 220, 255), 2, cv2.LINE_AA)
     if locked_id is not None:
-        canvas = draw_cn(canvas, f"已锁定 #{locked_id}", (W - 24, by + 82), 20, (0, 230, 150), anchor="rt")
-        canvas = draw_cn(canvas, f"置信度 {locked_conf:.2f}", (W - 24, by + 112), 18, (200, 210, 220), anchor="rt")
-    else:
-        canvas = draw_cn(canvas, "未锁定目标", (W - 24, by + 82), 20, (150, 160, 170), anchor="rt")
+        cv2.putText(canvas, f"LOCK #{locked_id}  {locked_conf:.2f}", (24, info_y + 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 245, 170), 2, cv2.LINE_AA)
+    if snap_thumb is not None and info_y + 130 < H:
+        canvas[info_y + 18:info_y + 112, W - 164:W - 24] = snap_thumb
     return canvas
 
 # ====== State ======
@@ -1425,7 +1706,7 @@ if not cap.isOpened():
 # Do not scan camera indexes 0..9 during startup: unavailable DirectShow/MSMF
 # devices can each block for hundreds of milliseconds and make the app appear dead.
 # The Refresh button still performs a full scan on demand.
-cam_devices = [{'index': cur, 'label': f"摄像头{cur}"}]
+cam_devices = [{'index': cur, 'label': f'\u6444\u50cf\u5934{cur}'}]
 cam_names = [cam_devices[0]['label']]
 camera_scan_lock = threading.Lock()
 camera_scan_running = False
@@ -1448,8 +1729,18 @@ sel_page = 0
 paused = False
 show_help = False
 auto_snap = False  # 默认关闭自动拍照，避免开机即抓拍
-snap_cooldown = float(_os.environ.get("YOLO_SNAP_COOLDOWN", "10"))
-snap_max_interval = float(_os.environ.get("YOLO_SNAP_MAX_INTERVAL", "30"))
+# ===== 鑷姩鎶撴媿鑺傚鎺у埗锛堣瑙?maybe_auto_snapshot锛?====
+# 绐佺劧鍑虹幇鐨勬柊浜轰箣闂寸殑鏈€鐭叏灞€闂撮殧(绉?锛屼粎闃插悓甯у浜哄埛灞忥紝涓嶅奖鍝嶁€滅珛鍒绘媿鈥濊涔?
+snap_new_cooldown = float(_os.environ.get("YOLO_SNAP_NEW_COOLDOWN", "1.0"))
+# 鍚屼竴鐩爣涓ゆ鎷嶇収鐨勬渶灏忛棿闅?绉?锛氶槻姝⑩€滃姩浣滃ぇ鈥濇椂杩炵画澶氬抚鍒峰睆
+snap_min_gap = float(_os.environ.get("YOLO_SNAP_MIN_GAP", "8.0"))
+# 绋冲畾鍦ㄥ満(浣嶇疆闄勮繎銆佸熀鏈笉鍔?鏃跺懆鏈熺暀瀛樻媿鐨勯棿闅?绉?锛氶殧涓€娈垫媿涓€寮?
+snap_periodic_interval = float(_os.environ.get("YOLO_SNAP_PERIODIC", "45.0"))
+# 甯ч棿涓績浣嶇Щ鍗犵敾闈㈡瘮渚嬶紝瓒呰繃瑙嗕负鈥滃姩浣滃箙搴﹀彉澶р€?
+snap_action_move = float(_os.environ.get("YOLO_SNAP_ACTION_MOVE", "0.18"))
+# 灏哄(闈㈢Н)鍙樺寲姣斾緥锛岃秴杩囪涓衡€滃姩浣滃箙搴﹀彉澶?鍑嗗绂诲紑鈥?
+snap_action_size = float(_os.environ.get("YOLO_SNAP_ACTION_SIZE", "0.40"))
+# 浜虹寮€瓒呰繃璇ョ鏁颁笖鍐嶆鍥炴潵锛岃涓烘柊浜嬩欢锛堥噸鏂板彲绔嬪嵆鎷嶏級
 snap_absence_reset = float(_os.environ.get("YOLO_SNAP_ABSENCE_RESET", "3"))
 last_snap_time = 0.0
 snap_flash = 0
@@ -1457,6 +1748,9 @@ snap_mode = "crop"   # "crop" = 拍检测物体, "full" = 全屏拍照(带水印
 last_snap_path = None  # 最近一次抓拍的绝对路径（用于手机端底部缩略图）
 
 # ====== 手机同步观看（局域网 MJPEG 推流）======
+remote_url = None
+remote_short_url = None
+qr_target = "public"
 STREAM_PORT = 8000
 streamer = MJPEGStreamer(port=STREAM_PORT, quality=STREAM_QUALITY, fps_cap=STREAM_FPS,
                          max_width=STREAM_MAX_WIDTH, max_height=720,
@@ -1466,6 +1760,8 @@ streamer = MJPEGStreamer(port=STREAM_PORT, quality=STREAM_QUALITY, fps_cap=STREA
                          get_status=lambda: {"recording": recording,
                                              "clients": streamer.client_count(),
                                              "remote": remote_url,
+                                             "short_url": remote_short_url,
+                                             "display_url": remote_short_url or remote_url or streamer.url,
                                              "lan": streamer.url,
                                              "detection_enabled": detection_enabled,
                                              "pose_enabled": pose_enabled,
@@ -1474,41 +1770,104 @@ streamer = MJPEGStreamer(port=STREAM_PORT, quality=STREAM_QUALITY, fps_cap=STREA
                                              "pose_error": pose_load_error,
                                              "pose_people": pose_people_count,
                                              "pose_keypoints": pose_visible_keypoints,
+                                             "pose_inference_ms": pose_async.inference_ms,
+                                             "detected_people": detected_people_count,
                                              "recognition_mode": "pose" if pose_enabled else ("detect" if detection_enabled else "monitor"),
                                              "auto_snap": auto_snap,
                                              "snapshot_count": snapshot_count,
                                              "last_snapshot": Path(last_snap_path).name if last_snap_path else None,
                                              "snapshot_dir": str(SNAP_DIR),
-                                             "camera_switching": camera_switching,
-                                             "camera_count": len(cam_devices),
-                                             "camera_indices": [d['index'] for d in cam_devices],
-                                             "multi_camera": multi_cam,
+                                            "camera_switching": camera_switching,
+                                            "camera_count": len(cam_devices),
+                                            "camera_indices": [d['index'] for d in cam_devices],
+                                            "camera_labels": [d['label'] for d in cam_devices],
+                                            "current_camera": cur,
+                                            "multi_camera": multi_cam,
                                              "active_camera_count": len(multi_threads) if multi_cam else 1,
                                              "qr_target": qr_target,
-                                             "qr_url": (remote_url if qr_target == "public" and remote_url else streamer.url),
+                                             "qr_url": ((remote_short_url or remote_url) if qr_target == "public" and remote_url else streamer.url),
                                              "stream_fps": streamer.encoded_fps,
                                              "encode_ms": streamer.encode_ms,
                                              "jpeg_kb": streamer.jpeg_kb,
-                                             "stream_width": STREAM_MAX_WIDTH,
-                                             "stream_quality": STREAM_QUALITY})
+                                             "stream_width": streamer.max_width,
+                                             "stream_quality": streamer.quality,
+                                             "stream_fps_cap": streamer.fps_cap,
+                                             "stream_profile": streamer.profile_name,
+                                             "pos_grid": {"cols": POS_GRID_COLS, "rows": POS_GRID_ROWS},
+                                             "position_map": (get_position_map_summary(("camera", cur))
+                                                              if not multi_cam else None),
+                                             "position_maps": ({th.label: get_position_map_summary(("camera", th.idx))
+                                                                for th in multi_threads}
+                                                              if multi_cam else None)})
 streamer.start()
 show_stream_qr = True   # 是否在窗口上叠加二维码/地址
-qr_target = "public"    # 二维码默认指向公网（隧道连上后自动显示公网二维码）
-remote_url = None       # 公网访问地址（由隧道回调填入）
 _qr_img = make_qr_image(streamer.url)  # 连上前先用局域网二维码；连上后自动切公网
 stream_url = streamer.url
 
 
+def _try_shorten_public_url(long_url):
+    """Best-effort public URL shortening; never block tunnel availability."""
+    from urllib.parse import quote, urlencode
+    from urllib.request import Request, urlopen
+
+    # cleanuri currently works reliably on this network and returns JSON.
+    try:
+        payload = urlencode({"url": long_url}).encode("ascii")
+        req = Request(
+            "https://cleanuri.com/api/v1/shorten",
+            data=payload,
+            headers={
+                "User-Agent": "YOLO-Remote-Monitor/1.0",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        with urlopen(req, timeout=12.0) as resp:
+            data = json.loads(resp.read(2048).decode("utf-8", errors="ignore"))
+        candidate = str(data.get("result_url", "")).replace("\/", "/").strip()
+        if candidate.startswith(("https://", "http://")) and len(candidate) < len(long_url):
+            return candidate
+    except Exception:
+        pass
+
+    providers = (
+        "https://is.gd/create.php?format=simple&url=" + quote(long_url, safe=""),
+        "https://tinyurl.com/api-create.php?url=" + quote(long_url, safe=""),
+    )
+    for api in providers:
+        try:
+            req = Request(api, headers={"User-Agent": "YOLO-Remote-Monitor/1.0"})
+            with urlopen(req, timeout=3.5) as resp:
+                candidate = resp.read(512).decode("utf-8", errors="ignore").strip()
+            if candidate.startswith(("https://", "http://")) and len(candidate) < len(long_url):
+                return candidate
+        except Exception:
+            continue
+    return None
+
 def set_remote_url(u):
     """隧道建立后回调：记录公网地址，并在二维码指向公网时刷新。"""
-    global remote_url, _qr_img, qr_target
+    global remote_url, remote_short_url, _qr_img, qr_target
     remote_url = u
-    print("\n[公网] 远程观看地址: " + u)
-    print("（手机用流量/异地网络打开此链接即可，无需同一 WiFi）\n")
+    remote_short_url = None
+    print("\n[Public] Remote URL: " + u)
     if qr_target == "public":
         _qr_img = make_qr_image(u)
-    # The tunnel callback runs on a worker thread. Never call OpenCV/Win32
-    # window APIs here; doing so can deadlock the main thread inside imshow().
+
+    def short_worker(expected_url=u):
+        global remote_short_url, _qr_img
+        short = None
+        for attempt in range(3):
+            short = _try_shorten_public_url(expected_url)
+            if short or remote_url != expected_url:
+                break
+            time.sleep(3.0 + attempt * 2.0)
+        if short and remote_url == expected_url:
+            remote_short_url = short
+            print("[Public] Short URL: " + short)
+            if qr_target == "public":
+                _qr_img = make_qr_image(short)
+
+    threading.Thread(target=short_worker, name="public-url-shortener", daemon=True).start()
 
 
 def do_toggle_stream_qr():
@@ -1546,7 +1905,7 @@ def do_toggle_qr_target():
         retry_tunnel()
         return
     qr_target = "public" if qr_target == "lan" else "lan"
-    _qr_img = make_qr_image(remote_url if qr_target == "public" else streamer.url)
+    _qr_img = make_qr_image((remote_short_url or remote_url) if qr_target == "public" else streamer.url)
     print(f"[二维码] 指向: {qr_target}")
 
 
@@ -1623,7 +1982,7 @@ def start_pose_warm_async():
         try:
             pm = load_pose_model()
             if pm is None:
-                raise RuntimeError(pose_load_error or "姿态模型加载失败")
+                raise RuntimeError(pose_load_error or "Pose model load failed")
             print("Warming up pose model in background...")
             dummy = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
             pm.predict(
@@ -1655,9 +2014,176 @@ def start_pose_warm_async():
 
 # 智能拍照：记录上次拍照的目标状态（位置+大小），用于判断是否需要补拍
 last_snap_target = None  # (cx, cy, w, h) 最近一次自动抓拍目标
-snap_move_threshold = 0.25  # 目标移动超过画面25%或尺寸变化超过50%时补拍
-snap_size_threshold = 0.5
+# 娉細鍔ㄤ綔/鍛ㄦ湡鎷嶇収闃堝€煎凡杩佺Щ鍒颁笂闈?snap_action_* / snap_periodic_interval 绛夊父閲?
 auto_snap_states = {}       # 每个摄像头独立维护冷却、离场与周期补拍状态
+
+# ====== 浣嶇疆鍗犵敤璁板繂锛堝骇浣嶈蹇嗭級======
+# 鎶婄敾闈㈡寜缃戞牸鍒囧垎涓鸿嫢骞测€滀綅缃€濓紝璁板綍姣忎釜浣嶇疆褰撳墠鍧愮潃璋侊紙track_id锛夈€?
+# 宸插仠鐣欏涔咃紱绌虹疆鏃惰浣忎笂涓€浣嶅崰鐢ㄨ€呫€備粎浠ヨ窡韪?id 鏍囪瘑鈥滆皝鈥濓紙鏃犱汉鑴歌瘑鍒級锛?
+# 鏁呪€滆皝鈥濇寚绯荤粺鏈浼氳瘽涓殑浜虹墿缂栧彿锛涢噸鍚悗 id 浼氶噸缃紝浣嗏€滄煇浣嶇疆涓婃鍧愮殑鏄汉鐗?X鈥?
+# 杩欎竴璁板繂浼氳鎸佷箙鍖栦繚鐣欍€?
+POS_GRID_COLS = int(_os.environ.get("YOLO_POS_COLS", "4"))
+POS_GRID_ROWS = int(_os.environ.get("YOLO_POS_ROWS", "2"))
+POS_MEM_FILE = BASE_DIR / "position_memory.json"
+POS_MEM_SAVE_INTERVAL = 10.0   # 鎸佷箙鍖栬妭娴侊紙绉掞級
+position_memory = {}           # camera_key -> [ {track_id, since, last_track_id, last_seen, snap}, ... ]
+_pos_mem_last_save = 0.0
+_global_last_snap = 0.0        # 浠绘剰鎽勫儚澶存渶杩戜竴娆℃姄鎷嶆椂鍒伙紙鐢ㄤ簬鏂颁汉绐佸彂鍐峰嵈锛?
+
+
+def _pos_index(cx, cy, fw, fh, cols=POS_GRID_COLS, rows=POS_GRID_ROWS):
+    """Internal helper."""
+    col = min(cols - 1, max(0, int(cx / max(fw, 1) * cols)))
+    row = min(rows - 1, max(0, int(cy / max(fh, 1) * rows)))
+    return row * cols + col
+
+
+def _pos_key(ck):
+    """Internal helper."""
+    if isinstance(ck, (tuple, list)):
+        return json.dumps(list(ck), ensure_ascii=False)
+    return str(ck)
+
+
+def _pos_load():
+    """Internal helper."""
+    global position_memory
+    try:
+        if POS_MEM_FILE.exists():
+            with open(POS_MEM_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for raw_key, arr in data.items():
+                try:
+                    key = tuple(json.loads(raw_key))
+                except Exception:
+                    key = raw_key
+                states = []
+                for st in arr:
+                    states.append({
+                        'track_id': None,                       # 閲嶅惎鍚庡綋鍓嶅崰鐢ㄦ竻闆?
+                        'since': 0.0,
+                        'last_track_id': st.get('last_track_id'),
+                        'last_seen': float(st.get('last_seen', 0.0) or 0.0),
+                        'snap': st.get('snap'),
+                    })
+                position_memory[key] = states
+    except Exception:
+        pass
+
+
+def _pos_mem_maybe_save(now):
+    global _pos_mem_last_save
+    if now - _pos_mem_last_save < POS_MEM_SAVE_INTERVAL:
+        return
+    _pos_mem_last_save = now
+    try:
+        serial = {}
+        for ck, arr in position_memory.items():
+            serial[_pos_key(ck)] = [
+                {'track_id': s['track_id'],
+                 'since': s['since'],
+                 'last_track_id': s['last_track_id'],
+                 'last_seen': s['last_seen'],
+                 'snap': s['snap']}
+                for s in arr
+            ]
+        with open(POS_MEM_FILE, "w", encoding="utf-8") as f:
+            json.dump(serial, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def update_position_memory(frame, boxes, camera_key):
+    """Internal helper."""
+    global position_memory
+    if frame is None or boxes is None:
+        return
+    fh, fw = frame.shape[:2]
+    xyxy_list, conf_list, cls_list, track_id_list = get_boxes_data(boxes)
+    n = POS_GRID_COLS * POS_GRID_ROWS
+    states = position_memory.setdefault(camera_key, [None] * n)
+    if len(states) != n:
+        states = [None] * n
+        position_memory[camera_key] = states
+
+    # 鏈抚鍚勭綉鏍肩殑鍗犵敤鑰咃紙鍚屾牸澶氫汉鍙栫疆淇″害鏈€楂橈級
+    cell_occ = [None] * n
+    for i in range(len(xyxy_list)):
+        cid = int(cls_list[i])
+        if focus and cid != focus_id:
+            continue
+        x1, y1, x2, y2 = map(int, xyxy_list[i])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(fw, x2), min(fh, y2)
+        if not is_valid_person_box(x1, y1, x2, y2):
+            continue
+        conf = float(conf_list[i])
+        if conf < PERSON_CONF:
+            continue
+        tid = int(track_id_list[i]) if i < len(track_id_list) else -1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        idx = _pos_index(cx, cy, fw, fh)
+        if cell_occ[idx] is None or conf > cell_occ[idx][1]:
+            cell_occ[idx] = (tid, conf)
+
+    now = time.time()
+    for idx in range(n):
+        st = states[idx]
+        if st is None:
+            st = {'track_id': None, 'since': 0.0,
+                  'last_track_id': None, 'last_seen': 0.0, 'snap': None}
+            states[idx] = st
+        occ = cell_occ[idx]
+        if occ is None:
+            if st['track_id'] is not None:
+                st['last_track_id'] = st['track_id']
+                st['last_seen'] = now
+                st['track_id'] = None
+                st['since'] = 0.0
+        else:
+            tid, _ = occ
+            if st['track_id'] != tid:
+                if st['track_id'] is not None:
+                    st['last_track_id'] = st['track_id']
+                    st['last_seen'] = now
+                st['track_id'] = tid
+                st['since'] = now
+    _pos_mem_maybe_save(now)
+
+
+def _pos_set_snap(camera_key, idx, path):
+    """Internal helper."""
+    states = position_memory.get(camera_key)
+    if states is None or idx < 0 or idx >= len(states):
+        return
+    if states[idx] is not None:
+        states[idx]['snap'] = path
+
+
+def get_position_map_summary(camera_key):
+    """Internal helper."""
+    states = position_memory.get(camera_key)
+    if not states:
+        return []
+    now = time.time()
+    out = []
+    for idx, st in enumerate(states):
+        if st is None:
+            out.append({"pos": idx, "occupied": False, "track_id": None,
+                        "dwell_s": 0, "last_track_id": None})
+            continue
+        occ = st['track_id'] is not None
+        out.append({
+            "pos": idx,
+            "occupied": occ,
+            "track_id": st['track_id'] if occ else None,
+            "dwell_s": int(now - st['since']) if occ else 0,
+            "last_track_id": st['last_track_id'],
+        })
+    return out
+
+
+_pos_load()  # 鍚姩鏃舵仮澶嶄笂娆＄殑搴т綅璁板繂
 
 # Latest detection results (updated each loop for snapshot functions)
 g_frame = None
@@ -1675,10 +2201,10 @@ locked_conf = 0.0
 locked_misses = 0
 LOCK_MISS_TOLERANCE = 12
 
-# ====== 多摄像头平铺模式 ======
+# ====== 澶氭憚鍍忓ご骞抽摵妯″紡 ======
 multi_cam = False          # 是否处于多摄平铺模式
 multi_threads = []         # [CamCaptureThread, ...] 每路独立采集线程
-multi_cached_results = []  # 每路摄像头的推理缓存 [{boxes, conf, cls}, ...]
+multi_cached_results = []  # 姣忚矾鎽勫儚澶寸殑鎺ㄧ悊缂撳瓨 [{boxes, conf, cls}, ...]
 multi_frame_counter = 0    # 全局帧计数器（仅用于多摄跳帧）
 MULTI_TILE_INFER_N = 2     # 多摄模式下每 N 帧推理一次（每路）
 
@@ -1745,13 +2271,14 @@ def do_refresh_cameras():
             with camera_scan_lock:
                 camera_scan_running = False
             _buttons_built_for_size = None
+            _update_tray_menu()   # 鎵弿瀹屾垚鍚庡埛鏂版墭鐩樿彍鍗曠殑鎽勫儚澶村垪琛?
 
     threading.Thread(target=worker, name="camera-scan", daemon=True).start()
 
 def clear_inference_state():
     global cached_boxes, g_boxes, locked_track_id, locked_box, locked_conf, locked_misses
     global multi_cached_results, _first_inference_logged, frame_counter, multi_frame_counter
-    global pose_people_count, pose_visible_keypoints
+    global pose_people_count, pose_visible_keypoints, detected_people_count
     cached_boxes = empty_inference_cache()
     g_boxes = cached_boxes
     multi_cached_results = [empty_inference_cache() for _ in multi_cached_results]
@@ -1764,6 +2291,8 @@ def clear_inference_state():
     _first_inference_logged = False
     pose_people_count = 0
     pose_visible_keypoints = 0
+    detected_people_count = 0
+    pose_async.reset()
     reset_auto_snap_state()
 
 
@@ -1850,7 +2379,7 @@ def do_manual_snap():
     Mode: crop = best detection object, full = entire frame with watermark."""
     global snap_flash
     if g_frame is None:
-        print("  [拍照] 尚未检测到画面")
+        print("  [拍照] 尚未获取到摄像头画面")
         return
 
     if snap_mode == "full":
@@ -1862,7 +2391,7 @@ def do_manual_snap():
         xyxy_list, conf_list, cls_list, _ = get_boxes_data(g_boxes)
         if len(xyxy_list) == 0:
             # No detections: save full frame without watermark
-            save_snapshot(g_frame, "无目标", 0.0)
+            save_snapshot(g_frame, "no_target", 0.0)
             snap_flash = 12
             return
         # 创建临时的 boxes 对象供 pick_best_detection 使用
@@ -1884,6 +2413,17 @@ def do_manual_snap():
 def do_exit():
     global running
     running = False
+
+
+def do_hide_to_tray():
+    """Internal helper."""
+    global show_desktop, _buttons_built_for_size
+    if tray_icon is None:
+        print("Status update")
+        return
+    show_desktop = False
+    _buttons_built_for_size = None
+    print("Status update")
 
 
 # ===================== 系统托盘 / 后台隐藏运行 =====================
@@ -1949,6 +2489,39 @@ def _destroy_desktop_window():
     except Exception:
         pass
     window_created = False
+
+
+def _enforce_window_size():
+    """Internal helper."""
+    try:
+        rect = cv2.getWindowImageRect(win)
+    except Exception:
+        return
+    if not rect or len(rect) < 4:
+        return
+    x, y, cw, ch = rect
+    if cw <= 0 or ch <= 0:
+        return
+    new_w, new_h = cw, ch
+    # 1) 鍏堟弧瓒虫渶灏忓昂瀵哥害鏉?
+    if new_w < MIN_WIN_W:
+        new_w = MIN_WIN_W
+    if new_h < MIN_WIN_H:
+        new_h = MIN_WIN_H
+    # 2) 鍐嶉攣瀹?16:9锛氫互瀹藉害涓哄熀鍑嗘帹绠楅珮搴︼紝楂樺害涓嶈冻鏃跺弽鍚戜互楂樺害涓哄噯
+    if abs(new_w / max(new_h, 1) - DISPLAY_ASPECT) > 0.01:
+        cand_h = round(new_w / DISPLAY_ASPECT)
+        if cand_h >= MIN_WIN_H:
+            new_h = cand_h
+        else:
+            new_h = MIN_WIN_H
+            new_w = round(new_h * DISPLAY_ASPECT)
+    # 浠呭湪鍋忕瀹瑰樊鏃惰皟鐢?resizeWindow锛岄伩鍏嶆瘡甯ф姈鍔ㄦ垨姝诲惊鐜?
+    if abs(new_w - cw) > WIN_RESIZE_TOL or abs(new_h - ch) > WIN_RESIZE_TOL:
+        try:
+            cv2.resizeWindow(win, new_w, new_h)
+        except Exception:
+            pass
 
 
 def _tray_show(icon, item):
@@ -2038,9 +2611,73 @@ def _tray_copy_url(icon, item):
     else:
         msg = "复制失败，请手动复制：\n" + url
     try:
-        icon.notify(msg, "YOLO 人体识别")
+        icon.notify(msg, "YOLO 人物识别")
     except Exception:
         pass
+
+
+def _tray_select_cam(idx):
+    """Internal helper."""
+    if multi_cam or camera_switching:
+        return
+    if idx == cur:
+        return
+    with pending_actions_lock:
+        # 鍚屼竴鎽勫儚澶村凡鍦ㄩ槦鍒楁湯灏惧垯涓嶅啀閲嶅鍏ラ槦
+        for a in pending_main_actions:
+            if isinstance(a, tuple) and a[0] == "select_cam" and a[1] == idx:
+                return
+        pending_main_actions.append(("select_cam", idx))
+
+
+def _tray_refresh_cameras(icon, item):
+    """Internal helper."""
+    do_refresh_cameras()
+
+
+def _update_tray_menu():
+    """Internal helper."""
+    if tray_icon is None:
+        return
+    try:
+        tray_icon.menu = build_tray_menu()
+    except Exception as e:
+        print(f"[托盘] 更新菜单失败: {e}")
+
+
+def _make_cam_select_action(idx):
+    """Internal helper."""
+    def _act(icon, item):
+        _tray_select_cam(idx)
+    return _act
+
+
+def build_tray_menu():
+    """Internal helper."""
+    import pystray
+    from pystray import Menu, MenuItem
+    items = [
+        MenuItem("显示画面", _tray_show),
+        MenuItem("隐藏画面", _tray_hide),
+        MenuItem("\u5237\u65b0\u6444\u50cf\u5934\u5217\u8868", _tray_refresh_cameras),
+    ]
+    cam_items = []
+    for device in cam_devices:
+        idx = device['index']
+        cam_items.append(
+            MenuItem(
+                device['label'],
+                _make_cam_select_action(idx),
+                checked=lambda item, idx=idx: idx == cur,
+                radio=True,
+            )
+        )
+    if cam_items:
+        items.append(MenuItem("\u5207\u6362\u6444\u50cf\u5934", Menu(*cam_items)))
+    items.append(Menu.SEPARATOR)
+    items.append(MenuItem("复制观看地址", _tray_copy_url))
+    items.append(MenuItem("\u9000\u51fa", _tray_exit))
+    return Menu(*items)
 
 
 def setup_tray():
@@ -2048,22 +2685,15 @@ def setup_tray():
     try:
         import pystray
         from pystray import Menu, MenuItem
-        menu = Menu(
-            MenuItem("显示画面", _tray_show),
-            MenuItem("隐藏画面", _tray_hide),
-            MenuItem("复制观看地址", _tray_copy_url),
-            Menu.SEPARATOR,
-            MenuItem("退出", _tray_exit),
-        )
         tray_icon = pystray.Icon("yolo_cam_tray", _make_tray_image(),
-                                 "YOLO 人体识别", menu)
+                                 "YOLO 人物识别", build_tray_menu())
         import threading as _th
         _th.Thread(target=tray_icon.run, daemon=True).start()
-        print("[托盘] 已启动系统托盘图标（后台隐藏运行），右键图标可显示画面或退出")
+        print("Status update")
     except Exception as e:
         global show_desktop
         show_desktop = True   # 托盘不可用则退回可见窗口，避免程序隐形且无法退出
-        print(f"[托盘] 启动失败，退回普通窗口模式（按 Q 或点窗口关闭退出）：{e}")
+        print(f"Tray startup failed: {e}")
 
 
 def do_prev_page():
@@ -2110,7 +2740,7 @@ def build_buttons(w, h):
 
     # ====== Normal mode ======
     current_device = next((device for device in cam_devices if device['index'] == cur), None)
-    cam_display = current_device['label'] if current_device else f"摄像头{cur}"
+    cam_display = current_device['label'] if current_device else f'\u6444\u50cf\u5934{cur}'
     btn_w = 92
     btn_h = 34
     gap = 8
@@ -2144,7 +2774,7 @@ def build_buttons(w, h):
         ))
         btn_mgr.add(Button(
             start_x + cam_card_w * 2 + cam_gap - cam_refresh_w, cam_base_y, cam_refresh_w, cam_header_h,
-            "扫描中" if camera_scan_running else "刷新列表", do_refresh_cameras,
+            "\u626b\u63cf\u4e2d" if camera_scan_running else "\u5237\u65b0\u5217\u8868", do_refresh_cameras,
             color=(88, 108, 138), text_color=(255, 255, 255), font_size=11
         ))
 
@@ -2164,26 +2794,35 @@ def build_buttons(w, h):
 
     # Function buttons on the right side
     fn_w = 92
-    fn_x = w - fn_w - 10
-    fn_start_y = h - btn_h - 8
+    # 澶氭憚妯″紡锛氬彸涓婅鏄簩缁寸爜鎺у埗鏍忥紙x: w-112~w锛寉: 54~208锛夈€傛寜閽粛璐存渶鍙筹紝
+    # 浣嗘暣鍒楁斁鍒颁簩缁寸爜鈥滀笅鏂光€濃€斺€旂缉灏忔寜閽珮搴︿笌闂磋窛锛屼娇椤剁浣庝簬 y鈮?08锛?
+    # 鏃笉鎸″乏渚ф憚鍍忓ご鐢婚潰锛堢敾闈㈠湪 x<w-112锛夛紝涔熶笉琚悗缁樺埗鐨勪簩缁寸爜鐩栦綇銆?
+    if multi_cam:
+        fn_h, fn_gap = 30, 6
+        fn_x = w - fn_w - 10
+    else:
+        fn_h, fn_gap = btn_h, gap
+        fn_x = w - fn_w - 10
+    fn_start_y = h - fn_h - 8
     fn_labels = [
-        ("切到监控" if detection_enabled else "开启识别", do_toggle_detection, not detection_enabled, (46, 132, 104), False),
-        ("姿态加载中" if pose_model_loading else ("关闭姿态" if pose_enabled else "姿态识别"), do_toggle_pose, pose_enabled, (40, 126, 164), False),
-        ("拍照", do_manual_snap, True, (56, 132, 92), False),
-        ("手机投屏", do_toggle_stream_qr, show_stream_qr, (48, 118, 148), False),
-        ("录制" if not recording else "停止录", toggle_recording, recording, (168, 64, 64), False),
-        ("多摄", do_toggle_multi_cam, multi_cam, (128, 80, 168), False),
-        ("自动拍", do_toggle_auto_snap, auto_snap, (148, 118, 48), False),
-        ("全屏拍" if snap_mode == "full" else "人物拍", do_toggle_snap_mode, snap_mode == "full", (88, 96, 148), False),
-        ("窗口化" if full else "全屏", toggle_full, full, (76, 76, 76), False),
-        ("继续" if paused else "暂停", do_toggle_pause, paused, (76, 76, 76), False),
-        ("帮助", do_toggle_help, show_help, (76, 76, 76), False),
-        ("退出", do_exit, False, (150, 58, 58), True),
+        ("\u5207\u5230\u76d1\u63a7" if detection_enabled else "\u5f00\u542f\u8bc6\u522b", do_toggle_detection, not detection_enabled, (46, 132, 104), False),
+        ("\u59ff\u6001\u52a0\u8f7d\u4e2d" if pose_model_loading else ("\u5173\u95ed\u59ff\u6001" if pose_enabled else "\u59ff\u6001\u8bc6\u522b"), do_toggle_pose, pose_enabled, (40, 126, 164), False),
+        ("\u62cd\u7167", do_manual_snap, True, (56, 132, 92), False),
+        ("\u624b\u673a\u6295\u5c4f", do_toggle_stream_qr, show_stream_qr, (48, 118, 148), False),
+        ("\u5f55\u5236" if not recording else "\u505c\u6b62\u5f55\u5236", toggle_recording, recording, (168, 64, 64), False),
+        ("\u591a\u6444", do_toggle_multi_cam, multi_cam, (128, 80, 168), False),
+        ("\u81ea\u52a8\u62cd", do_toggle_auto_snap, auto_snap, (148, 118, 48), False),
+        ("\u5168\u5c4f\u62cd" if snap_mode == "full" else "\u4eba\u7269\u62cd", do_toggle_snap_mode, snap_mode == "full", (88, 96, 148), False),
+        ("\u7a97\u53e3\u5316" if full else "\u5168\u5c4f", toggle_full, full, (76, 76, 76), False),
+        ("\u7ee7\u7eed" if paused else "\u6682\u505c", do_toggle_pause, paused, (76, 76, 76), False),
+        ("\u5e2e\u52a9", do_toggle_help, show_help, (76, 76, 76), False),
+        ("\u9690\u85cf\u5230\u6258\u76d8", do_hide_to_tray, False, (76, 76, 76), False),
+        ("\u9000\u51fa", do_exit, False, (150, 58, 58), True),
     ]
     for i, (label, cb, is_active, color, is_danger) in enumerate(fn_labels):
         base_color = (156, 62, 62) if is_danger else ((52, 138, 90) if is_active else (72, 72, 72))
         btn_mgr.add(Button(
-            fn_x, fn_start_y - (i + 1) * (btn_h + gap), fn_w, btn_h,
+            fn_x, fn_start_y - (i + 1) * (fn_h + fn_gap), fn_w, fn_h,
             label, cb,
             color=base_color,
             font_size=12
@@ -2228,7 +2867,7 @@ print("  1:Lock person  H:Help  Space:Snapshot  R:Record  B:QR target")
 print("  M:Snapshot mode  V:Toggle phone panel  D:Detection/Monitor  K:Pose")
 print("====================\n")
 
-# 实时帧率追踪
+# 瀹炴椂甯х巼杩借釜
 fps_frame_count = 0
 fps_start_time = time.time()
 fps_realtime = 0.0
@@ -2246,16 +2885,20 @@ while running:
             do_toggle_multi_cam()
         elif _main_action == "pose_toggle":
             do_toggle_pose()
+        elif isinstance(_main_action, tuple) and _main_action[0] == "select_cam":
+            do_select_cam(_main_action[1])
+            _update_tray_menu()   # 鍒囧畬鍚庡埛鏂版墭鐩樿彍鍗曠殑褰撳墠鎽勫儚澶村嬀閫?
     phone_frame_offered = False  # reset once per display loop
     # ====== 多摄像头平铺模式（跳过单摄读取） ======
     phone_canvas = None   # 手机端专用画面（默认 None，下面分支会赋值）
     if multi_cam:
         phone_canvas = None   # 手机端专用画面（干净、无桌面 UI），多摄时上下竖排
-        phone_stack = []      # 多摄各路的干净画面，竖排拼接用
+        phone_stack = []      # 澶氭憚鍚勮矾鐨勫共鍑€鐢婚潰锛岀珫鎺掓嫾鎺ョ敤
         pose_people_count = 0
         pose_visible_keypoints = 0
+        detected_people_count = 0
         multi_frame_counter += 1
-        multi_infer_interval = 3 if pose_enabled else MULTI_TILE_INFER_N
+        multi_infer_interval = 4 if pose_enabled else MULTI_TILE_INFER_N
         multi_do_infer = detection_enabled and active_model_ready() and (multi_frame_counter % multi_infer_interval == 0)
         raw_frames = read_all_frames()
         if multi_do_infer and raw_frames:
@@ -2278,15 +2921,22 @@ while running:
                 multi_cached_results = [empty_inference_cache() for _ in multi_cached_results]
                 if multi_frame_counter % 60 == 0:
                     print(f"Multi-camera batch inference failed: {exc}")
-        rows, cols = calc_grid(len(multi_threads))
+        n_valid = sum(1 for th in multi_threads if not th.error)
+        rows, cols = calc_grid(n_valid) if n_valid else (1, 1)
         grid_w = OUTPUT_W - MULTI_CONTROL_W
         grid_h = OUTPUT_H - MULTI_TOP_BAR_H
         canvas = np.full((OUTPUT_H, OUTPUT_W, 3), (16, 18, 22), dtype=np.uint8)
         cv2.line(canvas, (grid_w, MULTI_TOP_BAR_H), (grid_w, OUTPUT_H), (54, 58, 66), 1)
 
-        for ti, th in enumerate(multi_threads):
-            r = ti // cols
-            c = ti % cols
+        # 浠呮覆鏌撴湁淇″彿鐨勬憚鍍忓ご锛涙棤淇″彿鐨勮矾鐩存帴璺宠繃锛岀敾闈㈣嚜閫傚簲閲嶆帓锛堜笉鏄剧ず榛戞牸锛夈€?
+        valid_idx = [i for i, th in enumerate(multi_threads) if not th.error]
+        valid_threads = [multi_threads[i] for i in valid_idx]
+        valid_frames = [raw_frames[i] for i in valid_idx]
+        valid_cached = [multi_cached_results[i] for i in valid_idx]
+
+        for vi, th in enumerate(valid_threads):
+            r = vi // cols
+            c = vi % cols
             tx = c * grid_w // cols
             ty = MULTI_TOP_BAR_H + r * grid_h // rows
             tile_x2 = (c + 1) * grid_w // cols
@@ -2295,7 +2945,7 @@ while running:
             tile_h = tile_y2 - ty
             content_y = ty + MULTI_TILE_INFO_H
             content_h = max(1, tile_h - MULTI_TILE_INFO_H)
-            tile_frame = raw_frames[ti]
+            tile_frame = valid_frames[vi]
             label = th.label
             # 保持宽高比缩放 + 黑边填充（letterbox）
             fh, fw = tile_frame.shape[:2]
@@ -2304,13 +2954,15 @@ while running:
             canvas[content_y:tile_y2, tx:tile_x2] = tile_area
 
             # 绘制检测框（框在原始 tile 坐标，按显示缩放+偏移映射到画布）
-            res = multi_cached_results[ti]
+            res = valid_cached[vi]
+            detected_people_count += len(res.get('xyxy', []))
             if pose_enabled:
                 _pose_people, _pose_points = get_pose_metrics(res)
                 pose_people_count += _pose_people
                 pose_visible_keypoints += _pose_points
             # 每路摄像头使用自己的原始画面、检测结果和冷却状态自动抓拍。
-            maybe_auto_snapshot(tile_frame, res, ("camera", th.idx), f"摄像头{th.idx}")
+            update_position_memory(tile_frame, res, ("camera", th.idx))
+            maybe_auto_snapshot(tile_frame, res, ('camera', th.idx), f'\u6444\u50cf\u5934{th.idx}')
             sx = new_w / max(fw, 1)
             sy = new_h / max(fh, 1)
             if 'xyxy' in res and res['xyxy'] is not None and len(res['xyxy']) > 0:
@@ -2361,7 +3013,7 @@ while running:
             cap_h_ = int(th.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or fh
             res_str = f"{cap_w_}x{cap_h_}"
             fps_val = th.fps
-            status_str = "无信号" if th.error else f"{fps_val:.1f} FPS"
+            status_str = "\u65e0\u4fe1\u53f7" if th.error else f"{fps_val:.1f} FPS"
             status_color = (120, 160, 255) if th.error else (90, 230, 255)
             canvas = draw_cn(canvas, res_str, (tx + 8, ty + 24), 11, (190, 196, 205))
             canvas = draw_cn(canvas, status_str, (tile_x2 - 8, ty + 24), 11,
@@ -2370,19 +3022,19 @@ while running:
         # 手机端多摄画面（干净、无桌面 UI）
         if streamer.phone_layout == "tile":
             # 横屏/全屏：平铺，每路占满宽，黑边更少
-            _rows, _cols = calc_grid(len(multi_threads))
+            _rows, _cols = calc_grid(n_valid) if n_valid else (1, 1)
             _tw, _th = 1280 // _cols, 720 // _rows
             pt_canvas = np.zeros((720, 1280, 3), np.uint8)
-            for ti, th_ in enumerate(multi_threads):
-                r = ti // _cols
-                c = ti % _cols
+            for vi, th_ in enumerate(valid_threads):
+                r = vi // _cols
+                c = vi % _cols
                 _tx = c * _tw
                 _ty = r * _th
-                _f = raw_frames[ti]
+                _f = valid_frames[vi]
                 fh, fw = _f.shape[:2]
                 _tile, _s, _ox, _oy, _nw, _nh = fit_complete_on_blur(_f, _tw, _th)
                 pt_canvas[_ty:_ty + _th, _tx:_tx + _tw] = _tile
-                _res = multi_cached_results[ti]
+                _res = valid_cached[vi]
                 if 'xyxy' in _res and _res['xyxy'] is not None and len(_res['xyxy']) > 0:
                     _sx, _sy = _nw / max(fw, 1), _nh / max(fh, 1)
                     for bi in range(len(_res['xyxy'])):
@@ -2399,12 +3051,16 @@ while running:
                         return px * __sx + __tx, py * __sy + __ty
                     draw_pose_skeleton(pt_canvas, _res.get('keypoints'),
                                        _res.get('keypoint_conf'), _phone_tile_pose_transform)
-            phone_canvas = pt_canvas
+            phone_canvas = pt_canvas if n_valid else make_no_signal_frame()
         else:
             # 竖屏：上下竖排拼接（无桌面 UI）
             if phone_stack:
                 phone_canvas = np.vstack(phone_stack)
+            else:
+                phone_canvas = make_no_signal_frame()
 
+        if phone_canvas is None:
+            phone_canvas = make_no_signal_frame()
         if phone_canvas is not None and streamer.client_count() > 0:
             streamer.update(phone_canvas)
             phone_frame_offered = True
@@ -2423,7 +3079,7 @@ while running:
         frame_h, frame_w = OUTPUT_H, OUTPUT_W
         cam_w, cam_h = OUTPUT_W, OUTPUT_H
 
-        # 全局 FPS（用于日期下方显示）
+        # 鍏ㄥ眬 FPS锛堢敤浜庢棩鏈熶笅鏂规樉绀猴級
         fps_frame_count += 1
         elapsed = time.time() - fps_start_time
         if elapsed >= 1.0:
@@ -2433,12 +3089,20 @@ while running:
     elif not paused:
         ret, frame = cap.read()
         if not ret:
-            start_cam_transition()   # 设备断流重连：旧画面缓出，新画面淡入
-            cap.release()
+            # 鎽勫儚澶存柇娴侊細閲婃斁骞跺皾璇曢噸杩烇紝涓嶉€€鍑虹▼搴?
+            try:
+                cap.release()
+            except Exception:
+                pass
             cap, cam_w, cam_h, cam_fps = open_cam(cur)
             ret, frame = cap.read()
         if not ret:
-            break
+            # 浠嶆棤淇″彿锛氬悜鎵嬫満绔帹閫佸崰浣嶅抚锛屽悗鍙版寔缁噸璇曢噸杩烇紙涓嶅啀閫€鍑虹▼搴忥級
+            if streamer.client_count() > 0:
+                streamer.update(make_no_signal_frame())
+                phone_frame_offered = True
+            time.sleep(0.5)
+            continue
 
         if frame.shape[1] != OUTPUT_W or frame.shape[0] != OUTPUT_H:
             frame = cv2.resize(frame, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
@@ -2452,33 +3116,31 @@ while running:
             phone_frame_offered = True
 
         frame_counter += 1
-        # 跳帧推理：只在指定间隔推理，中间帧复用缓存
-        do_infer = detection_enabled and active_model_ready() and (frame_counter % INFER_EVERY_N == 0)
-
-        if do_infer:
-            if not _first_inference_logged:
-                print("First live inference started.")
-            _infer_t0 = time.perf_counter()
-            # 姿态模式直接替代框检测，避免同时跑两个模型造成帧率下降。
-            inference_model = active_inference_model()
-            results = inference_model.track(
-                frame,
-                imgsz=POSE_INFER_SIZE if pose_enabled else INFER_SIZE,
-                verbose=False,
-                half=USE_HALF,
-                persist=True,
-                tracker="bytetrack.yaml",
-                classes=[0 if pose_enabled else focus_id],
-                conf=PERSON_CONF,
-                iou=PERSON_IOU,
-            )
-            if not _first_inference_logged:
-                mode_name = "pose" if pose_enabled else "detect"
-                print(f"First {mode_name} inference finished in {(time.perf_counter() - _infer_t0) * 1000:.1f} ms.")
+        if pose_enabled:
+            # Newest-frame asynchronous pose inference: video capture and MJPEG
+            # delivery never wait for the keypoint network.
+            if detection_enabled and active_model_ready() and frame_counter % POSE_INFER_EVERY_N == 0:
+                pose_async.submit(frame)
+            boxes = pose_async.latest()
+            cached_boxes = boxes
+            if pose_async.completed and not _first_inference_logged:
+                print(f"First async pose inference finished in {pose_async.inference_ms:.1f} ms.")
                 _first_inference_logged = True
-            cached_boxes = result_to_cache(results[0])
-            boxes = cached_boxes
         else:
+            do_infer = detection_enabled and active_model_ready() and (frame_counter % INFER_EVERY_N == 0)
+            if do_infer:
+                if not _first_inference_logged:
+                    print("First live inference started.")
+                _infer_t0 = time.perf_counter()
+                results = model.track(
+                    frame, imgsz=INFER_SIZE, verbose=False, half=USE_HALF,
+                    persist=True, tracker="bytetrack.yaml", classes=[focus_id],
+                    conf=PERSON_CONF, iou=PERSON_IOU,
+                )
+                if not _first_inference_logged:
+                    print(f"First detect inference finished in {(time.perf_counter() - _infer_t0) * 1000:.1f} ms.")
+                    _first_inference_logged = True
+                cached_boxes = result_to_cache(results[0])
             boxes = cached_boxes
 
         if pose_enabled:
@@ -2496,7 +3158,7 @@ while running:
             if _p >= 1.0:
                 cam_transition['active'] = False
             else:
-                _e = _p * _p * (3 - 2 * _p)   # smoothstep 缓动
+                _e = _p * _p * (3 - 2 * _p)   # smoothstep 缂撳姩
                 ann = cv2.addWeighted(frame, _e, cam_transition['old'], 1 - _e, 0)
         frame_h, frame_w = frame.shape[:2]
 
@@ -2526,6 +3188,10 @@ while running:
                 'box': (x1, y1, x2, y2),
                 'area': area,
             })
+
+        # 姣忓抚鏇存柊浣嶇疆鍗犵敤璁板繂锛堝骇浣嶈蹇嗭級锛屼笌鑷姩鎷嶇収寮€鍏虫棤鍏?
+        detected_people_count = len(candidates)
+        update_position_memory(frame, boxes, ("camera", cur))
 
         active_target = None
         if locked_track_id is not None:
@@ -2578,19 +3244,10 @@ while running:
         # 仅在有手机观看时才合成，避免无人观看时白白消耗 CPU。
         if not phone_frame_offered:
             if streamer.client_count() > 0:
-                if streamer.phone_layout == "stack" or (detection_enabled and PHONE_INFO_PANEL):
-                    _snap_thumb = get_snap_thumb()
-                    phone_canvas = make_phone_portrait(
-                        ann,
-                        person_count=len(candidates),
-                        fps=fps_realtime,
-                        locked_id=locked_track_id,
-                        locked_conf=locked_conf,
-                        snap_thumb=_snap_thumb,
-                        online=streamer.client_count(),
-                    )
-                else:
-                    phone_canvas = ann
+                # Send the original 16:9 annotated frame. The browser uses
+                # object-fit: contain to adapt it to phones, tablets and desktop
+                # screens without server-side portrait padding or cropping.
+                phone_canvas = ann
                 streamer.update(phone_canvas)
                 phone_frame_offered = True
             else:
@@ -2612,15 +3269,15 @@ while running:
     if show_desktop:
         # ====== Normal detection mode ======
         if not detection_enabled:
-            title_txt = "[纯监控模式] 已关闭模型识别, 按D 恢复识别"
+            title_txt = "[\u7eaf\u76d1\u63a7\u6a21\u5f0f] \u5df2\u5173\u95ed\u6a21\u578b\u8bc6\u522b, \u6309D\u6062\u590d"
         elif pose_enabled and pose_model_loading:
-            title_txt = "[姿态模型加载中] 摄像头与远程画面保持正常"
+            title_txt = "[\u59ff\u6001\u6a21\u578b\u52a0\u8f7d\u4e2d] \u753b\u9762\u4fdd\u6301\u6d41\u7545"
         elif pose_enabled and pose_load_error and not pose_model_ready:
-            title_txt = "[姿态模型失败] 请再次点击姿态识别重试"
+            title_txt = "[\u59ff\u6001\u6a21\u578b\u52a0\u8f7d\u5931\u8d25]"
         elif not active_model_ready():
-            title_txt = "[模型加载中] 摄像头画面已正常显示"
+            title_txt = "[\u6a21\u578b\u52a0\u8f7d\u4e2d] \u6444\u50cf\u5934\u753b\u9762\u5df2\u663e\u793a"
         else:
-            title_txt = f"[{current_recognition_name()}] K:切换姿态 M:拍照模式"
+            title_txt = f"[{current_recognition_name()}] K:\u5207\u6362\u59ff\u6001 M:\u62cd\u7167\u6a21\u5f0f"
 
         if multi_cam:
             # 多摄全局状态集中在独立顶部栏，不覆盖第一排摄像头信息。
@@ -2637,16 +3294,16 @@ while running:
             ann = draw_cn(ann, date_str, (w - MULTI_CONTROL_W - 12, 6), 13,
                           (235, 235, 215), anchor="rt")
 
-            state_parts = ["已暂停" if paused else "运行中"]
+            state_parts = ["\u5df2\u6682\u505c" if paused else "\u8fd0\u884c\u4e2d"]
             if pose_enabled:
-                pose_state = "姿态加载中" if pose_model_loading else f"姿态:{pose_people_count}人/{pose_visible_keypoints}点"
+                pose_state = "\u59ff\u6001\u52a0\u8f7d\u4e2d" if pose_model_loading else f"\u59ff\u6001:{pose_people_count}\u4eba/{pose_visible_keypoints}\u70b9"
                 state_parts.append(pose_state)
             if recording:
-                state_parts.append("录制中")
+                state_parts.append("\u5f55\u5236\u4e2d")
             if auto_snap:
-                state_parts.append(f"自动拍:{'全屏' if snap_mode == 'full' else '人物'}")
-            state_txt = "状态: " + " | ".join(state_parts)
-            overview_txt = f"{len(multi_threads)}路画面 | 总循环 {fps_realtime:.1f} FPS"
+                state_parts.append("\u81ea\u52a8\u62cd\u7167")
+            state_txt = "\u72b6\u6001: " + " | ".join(state_parts)
+            overview_txt = f"{len(multi_threads)}\u8def\u753b\u9762 | {fps_realtime:.1f} FPS"
             overview_w = text_pixel_width(overview_txt, 12)
             state_max_w = max(80, w - MULTI_CONTROL_W - overview_w - 48)
             state_txt = ellipsize_text(state_txt, state_max_w, 12)
@@ -2660,7 +3317,7 @@ while running:
                               (0, 255, 255), (0, 0, 0))
             ann = draw_cn(ann, title_txt, (10, 28), 16, (0, 255, 0), (30, 30, 30))
             if recording and not show_stream_qr:
-                ann = draw_cn(ann, "● 录制中", (w // 2 - 44, 30), 18,
+                ann = draw_cn(ann, "\u25cf \u5f55\u5236\u4e2d", (w // 2 - 44, 30), 18,
                               (255, 90, 90), (40, 0, 0))
 
         # ====== Build and draw buttons ======
@@ -2671,15 +3328,12 @@ while running:
         # Help overlay
         if show_help and not sel:
             help_texts = [
-                "===== 帮助 =====",
-                "Q:退出 F:全屏 P:暂停",
-                "左侧两列卡片可直接选择工作摄像头",
-                "点“刷新列表”可重新扫描插拔后的摄像头",
-                "C/X:备用切换 1:锁定人物 H:帮助",
-                "Space:拍照 R:录制/停止 B:二维码切换(局域网/公网)",
-                "M:切换全屏拍照/人物抓拍 K:姿态识别开关",
-                "手机:可切换姿态/拍照/录制/回放，公网同步显示骨架",
-                "================",
+                "===== HELP =====",
+                "Q:Quit F:Fullscreen P:Pause",
+                "Click camera cards to switch camera",
+                "Refresh list after plugging cameras",
+                "Space:Snapshot R:Record B:QR",
+                "M:Snapshot mode K:Pose D:Monitor",
             ]
             overlay_h = len(help_texts) * 26 + 20
             overlay2 = np.full((overlay_h, w, 3), (0, 0, 0), dtype=np.uint8)
@@ -2726,17 +3380,36 @@ while running:
     # ====== Auto-snapshot ======
     # 多摄模式已在每个 tile 内分别处理；单摄使用当前原始帧与当前检测结果。
     if not multi_cam:
-        maybe_auto_snapshot(frame, boxes, ("camera", cur), f"摄像头{cur}")
+        maybe_auto_snapshot(frame, boxes, ('camera', cur), f'\u6444\u50cf\u5934{cur}')
 
     # Flash effect
     if snap_flash > 0:
-        ann = cv2.addWeighted(ann, 1.0, np.full_like(ann, 255), 0.4, 0)
+        k = snap_flash / 12.0                      # 1 鈫?0锛氶殢甯ф暟鑷劧娣″嚭
+        alpha = 0.12 * k                           # 宄板€间粎 12% 鐧借挋鐗?
+        white = np.full_like(ann, 255)
+        ann = cv2.addWeighted(ann, 1.0 - alpha, white, alpha, 0)
         snap_flash -= 1
 
     # Auto-snap indicator is already included in the multicamera top status bar.
     if auto_snap and not multi_cam:
         mode_txt = f"[自动拍:{'开' if auto_snap else '关'}|{'全屏' if snap_mode=='full' else '人物'}]"
         ann = draw_cn(ann, mode_txt, (10, 50), 15, (0, 200, 255), (0, 0, 0))
+
+    # 搴т綅璁板繂锛堜綅缃崰鐢級鎽樿锛氬崟鎽勬ā寮忓簳閮ㄥ乏渚ф樉绀哄崰鐢ㄦ儏鍐?
+    if detection_enabled and not multi_cam:
+        _pmap = get_position_map_summary(("camera", cur))
+        if _pmap:
+            _occ = [p for p in _pmap if p["occupied"]]
+            _occ_n = len(_occ)
+            _new = [str(p["pos"]) for p in _occ
+                    if p["track_id"] is not None and p["dwell_s"] <= 5]
+            _detail = " ".join(f"#{p['track_id']}@{p['pos']}({p['dwell_s']}s)" for p in _occ)
+            _seat_txt = f"位置记忆 {_occ_n}/{len(_pmap)} 占用"
+            if _new:
+                _seat_txt += f" | 新来位置: {'/'.join(_new)}"
+            ann = draw_cn(ann, _seat_txt, (10, h - 30), 14, (120, 220, 255), (0, 0, 0))
+            if _detail:
+                ann = draw_cn(ann, _detail, (10, h - 12), 12, (180, 200, 210), (0, 0, 0))
 
 
     # ====== 录制（录屏回放）：写入当前画面 ======
@@ -2753,7 +3426,7 @@ while running:
     if not phone_frame_offered:
         streamer.update(phone_canvas if phone_canvas is not None else ann)
 
-    # ====== 手机投屏：窗口上叠加二维码与访问地址 ======
+    # ====== 鎵嬫満鎶曞睆锛氱獥鍙ｄ笂鍙犲姞浜岀淮鐮佷笌璁块棶鍦板潃 ======
     if show_stream_qr and show_desktop:
         if multi_cam:
             # 多摄使用右侧控制栏内的紧凑二维码，避免遮住第一路信息栏与 FPS。
@@ -2798,7 +3471,7 @@ while running:
                     qr_resized = cv2.resize(_qr_img, (qr_size, qr_size),
                                             interpolation=cv2.INTER_NEAREST)
                     ann[panel_y + pad:qy2, panel_x + pad:qx2] = qr_resized
-            # 文本
+            # 鏂囨湰
             tx = panel_x + pad + qr_size + 12
             ann = draw_cn(ann, "手机同步观看", (tx, panel_y + pad + 2), 16, (0, 255, 180))
             ann = draw_cn(ann, f"局域网: {stream_url}", (tx, panel_y + pad + 30), 13, (255, 230, 120))
@@ -2808,11 +3481,14 @@ while running:
             target_txt = f"在线: {streamer._clients}  [{'公网' if qr_target == 'public' else '局域网'}二维码]"
             ann = draw_cn(ann, target_txt, (tx, panel_y + pad + 80), 12, (150, 220, 255))
             if recording:
-                ann = draw_cn(ann, "● 录制中", (tx, panel_y + pad + 104), 13, (255, 90, 90))
+                ann = draw_cn(ann, "\u25cf \u5f55\u5236\u4e2d", (tx, panel_y + pad + 104), 13, (255, 90, 90))
 
     if show_desktop:
         if not window_created:
             _create_desktop_window(full)
+        # 闈炲叏灞忔椂閿佸畾绐楀彛涓?16:9 涓斾笉灏忎簬鏈€灏忓昂瀵革紝閬垮厤鐢婚潰/鎸夐挳琚媺浼?
+        if not full:
+            _enforce_window_size()
         cv2.imshow(win, ann)
         key = cv2.waitKey(1) & 0xFF
     else:
